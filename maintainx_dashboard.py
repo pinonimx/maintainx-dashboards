@@ -537,7 +537,10 @@ tbody tr:hover td{{background:#f8fafc}}
 <body>
 <div class="hdr">
   <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;">
-    <h1>Open Work Order Dashboard</h1>
+    <div style="display:flex;align-items:center;gap:16px;">
+      <a href="/" style="color:rgba(255,255,255,.65);font-size:.8rem;text-decoration:none;display:flex;align-items:center;gap:4px;padding:4px 10px;border:1px solid rgba(255,255,255,.25);border-radius:6px;transition:background .15s;" onmouseover="this.style.background='rgba(255,255,255,.1)'" onmouseout="this.style.background='transparent'">← Home</a>
+      <h1>Open Work Order Dashboard</h1>
+    </div>
     <span style="font-size:.75rem;opacity:.55;">{generated_at}</span>
   </div>
 </div>

@@ -382,9 +382,12 @@ def build_po_html(pos, generated_at):
 </head>
 <body>
 <div class="header">
-  <div>
-    <h1>Accounts Payable &mdash; Purchase Orders</h1>
-    <div class="sub">Generated {generated_at}</div>
+  <div style="display:flex;align-items:center;gap:14px;">
+    <a href="/" style="font-size:.8rem;color:#64748b;text-decoration:none;padding:5px 12px;border:1px solid #e2e8f0;border-radius:6px;white-space:nowrap;transition:background .15s;" onmouseover="this.style.background='#f1f5f9'" onmouseout="this.style.background='transparent'">← Home</a>
+    <div>
+      <h1>Accounts Payable &mdash; Purchase Orders</h1>
+      <div class="sub">Generated {generated_at}</div>
+    </div>
   </div>
 </div>
 
