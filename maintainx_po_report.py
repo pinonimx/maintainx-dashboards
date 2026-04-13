@@ -57,18 +57,18 @@ def get_api_key():
     return key
 
 # ── Rate-limit-safe GET ──────────────────────────────────────────────────────────
-def _safe_get(session, url, params=None, max_retries=4, base_wait=15):
-    """GET with automatic 429 retry/backoff. Raises on non-429 HTTP errors."""
-    for attempt in range(1, max_retries + 1):
-        resp = session.get(url, params=params, timeout=30)
-        if resp.status_code == 429:
-            wait = int(resp.headers.get("Retry-After", base_wait * attempt))
-            print(f"  Rate limited — waiting {wait}s (attempt {attempt}/{max_retries})...")
-            time.sleep(wait)
-            continue
-        resp.raise_for_status()
-        return resp
-    raise requests.exceptions.HTTPError(f"Still rate-limited after {max_retries} retries: {url}")
+# def _safe_get(session, url, params=None, max_retries=4, base_wait=15):
+#     """GET with automatic 429 retry/backoff. Raises on non-429 HTTP errors."""
+#     for attempt in range(1, max_retries + 1):
+#         resp = session.get(url, params=params, timeout=30)
+#         if resp.status_code == 429:
+#             wait = int(resp.headers.get("Retry-After", base_wait * attempt))
+#             print(f"  Rate limited — waiting {wait}s (attempt {attempt}/{max_retries})...")
+#             time.sleep(wait)
+#             continue
+#         resp.raise_for_status()
+#         return resp
+#     raise requests.exceptions.HTTPError(f"Still rate-limited after {max_retries} retries: {url}")
 
 
 # ── Vendor map ───────────────────────────────────────────────────────────────────
