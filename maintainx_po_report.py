@@ -141,7 +141,7 @@ def fetch_completed_pos(api_key, force_refresh=False):
     vendor_map = _fetch_vendor_map(session)
     print(f"  Found {len(vendor_map)} vendor(s).")
 
-    # Step 1: scan list endpoint → {po_id (int): status (str)}
+# Step 1: scan list endpoint → {po_id (int): status (str)}
     print("  Scanning PO list...")
     current: dict[int, str] = {}
     cursor = None
