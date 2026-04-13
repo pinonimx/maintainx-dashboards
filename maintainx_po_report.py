@@ -56,6 +56,21 @@ def get_api_key():
         sys.exit(1)
     return key
 
+# ── Rate-limit-safe GET ──────────────────────────────────────────────────────────
+def _safe_get(session, url, params=None, max_retries=4, base_wait=15):
+    """GET with automatic 429 retry/backoff. Raises on non-429 HTTP errors."""
+    for attempt in range(1, max_retries + 1):
+        resp = session.get(url, params=params, timeout=30)
+        if resp.status_code == 429:
+            wait = int(resp.headers.get("Retry-After", base_wait * attempt))
+            print(f"  Rate limited — waiting {wait}s (attempt {attempt}/{max_retries})...")
+            time.sleep(wait)
+            continue
+        resp.raise_for_status()
+        return resp
+    raise requests.exceptions.HTTPError(f"Still rate-limited after {max_retries} retries: {url}")
+
+
 # ── Vendor map ───────────────────────────────────────────────────────────────────
 def _fetch_vendor_map(session):
     """Return {vendorId (int): name (str)} for all vendors in the org."""
@@ -66,8 +81,7 @@ def _fetch_vendor_map(session):
         if cursor:
             params["cursor"] = cursor
         try:
-            resp = session.get(f"{BASE_URL}/vendors", params=params, timeout=30)
-            resp.raise_for_status()
+            resp = _safe_get(session, f"{BASE_URL}/vendors", params=params)
             body = resp.json()
         except Exception:
             break
@@ -79,6 +93,7 @@ def _fetch_vendor_map(session):
         cursor = body.get("nextCursor")
         if not cursor or len(vendors) < PAGE_SIZE:
             break
+        time.sleep(0.2)
     return vendor_map
 
 # ── Cache helpers ────────────────────────────────────────────────────────────────
@@ -134,8 +149,7 @@ def fetch_completed_pos(api_key, force_refresh=False):
         params = {"limit": PAGE_SIZE}
         if cursor:
             params["cursor"] = cursor
-        resp = session.get(f"{BASE_URL}/purchaseorders", params=params, timeout=30)
-        resp.raise_for_status()
+        resp = _safe_get(session, f"{BASE_URL}/purchaseorders", params=params)
         body = resp.json()
         batch = next((v for k, v in body.items() if isinstance(v, list)), None)
         if not batch:
@@ -147,6 +161,7 @@ def fetch_completed_pos(api_key, force_refresh=False):
         cursor = body.get("nextCursor")
         if not cursor:
             break
+        time.sleep(0.2)
 
     print(f"  List scan complete — {len(current)} completed/partial PO(s) on server.")
 
