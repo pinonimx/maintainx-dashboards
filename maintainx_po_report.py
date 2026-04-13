@@ -81,7 +81,8 @@ def _fetch_vendor_map(session):
         if cursor:
             params["cursor"] = cursor
         try:
-            resp = _safe_get(session, f"{BASE_URL}/vendors", params=params)
+            resp = session.get(f"{BASE_URL}/vendors", params=params, timeout=30)
+            resp.raise_for_status()
             body = resp.json()
         except Exception:
             break
@@ -93,8 +94,21 @@ def _fetch_vendor_map(session):
         cursor = body.get("nextCursor")
         if not cursor or len(vendors) < PAGE_SIZE:
             break
-        time.sleep(0.2)
     return vendor_map
+
+
+def _sort_pos(pos):
+    """Sort POs: COMPLETED first, then most recently updated."""
+    def _key(p):
+        status_order = 0 if (p.get("status") or "").upper() == "COMPLETED" else 1
+        raw = p.get("updatedAt") or p.get("approvalDate") or "2000-01-01T00:00:00Z"
+        try:
+            ts = datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
+        except Exception:
+            ts = 0
+        return (status_order, -ts)
+    pos.sort(key=_key)
+    return pos
 
 # ── Cache helpers ────────────────────────────────────────────────────────────────
 def load_cache():
@@ -121,15 +135,7 @@ def save_cache(pos_by_id):
 def fetch_completed_pos(api_key, force_refresh=False):
     """
     Fetch all COMPLETED and PARTIALLY_FULFILLED POs with full details.
-
-    Strategy (cache-aware):
-      1. Scan the list endpoint (id + status only — fast, a few pages)
-      2. Compare to local cache:
-           - PO in cache with same status  → use cached copy (no API call)
-           - PO not in cache or status changed → fetch full record from API
-           - PO removed from target statuses → drop from cache
-      3. Save updated cache to disk
-      4. --refresh flag bypasses the cache and re-fetches everything
+    Falls back to file cache if rate-limited.
     """
     session = requests.Session()
     session.headers.update({
@@ -137,11 +143,21 @@ def fetch_completed_pos(api_key, force_refresh=False):
         "Content-Type": "application/json",
     })
 
-    print("  Fetching vendor list...")
-    vendor_map = _fetch_vendor_map(session)
-    print(f"  Found {len(vendor_map)} vendor(s).")
+    # Load cache FIRST so we can fall back to it if rate-limited
+    cache: dict[str, dict] = {} if force_refresh else load_cache()
 
-# Step 1: scan list endpoint → {po_id (int): status (str)}
+    # ── Vendor map ────────────────────────────────────────────────────────────────
+    print("  Fetching vendor list...")
+    try:
+        vendor_map = _fetch_vendor_map(session)
+        print(f"  Found {len(vendor_map)} vendor(s).")
+    except requests.exceptions.HTTPError as e:
+        if e.response is not None and e.response.status_code == 429 and cache:
+            print("  Rate limited on vendor fetch — serving cached data.")
+            return _sort_pos(list(cache.values()))
+        raise
+
+    # ── Step 1: scan list endpoint ────────────────────────────────────────────────
     print("  Scanning PO list...")
     current: dict[int, str] = {}
     cursor = None
@@ -149,25 +165,28 @@ def fetch_completed_pos(api_key, force_refresh=False):
         params = {"limit": PAGE_SIZE}
         if cursor:
             params["cursor"] = cursor
-        resp = _safe_get(session, f"{BASE_URL}/purchaseorders", params=params)
+        resp = session.get(f"{BASE_URL}/purchaseorders", params=params, timeout=30)
+        if resp.status_code == 429:
+            if cache:
+                print("  Rate limited on PO scan — serving cached data.")
+                return _sort_pos(list(cache.values()))
+            resp.raise_for_status()
+        resp.raise_for_status()
         body = resp.json()
         batch = next((v for k, v in body.items() if isinstance(v, list)), None)
         if not batch:
             break
-        for po in batch:
-            status = (po.get("status") or "").upper().strip()
+        for po_item in batch:
+            status = (po_item.get("status") or "").upper().strip()
             if status in ALL_FETCH:
-                current[int(po["id"])] = status
+                current[int(po_item["id"])] = status
         cursor = body.get("nextCursor")
         if not cursor:
             break
-        time.sleep(0.2)
 
     print(f"  List scan complete — {len(current)} completed/partial PO(s) on server.")
 
-    # Step 2: load cache and decide what to fetch
-    cache: dict[str, dict] = {} if force_refresh else load_cache()
-
+    # ── Step 2: decide what to fetch ──────────────────────────────────────────────
     ids_to_fetch = []
     for po_id, status in current.items():
         key = str(po_id)
@@ -179,12 +198,12 @@ def fetch_completed_pos(api_key, force_refresh=False):
         ids_to_fetch = list(current.keys())
         print("  --refresh: ignoring cache, re-fetching all POs.")
     elif ids_to_fetch:
-        print(f"  {len(current) - len(ids_to_fetch)} PO(s) loaded from cache, "
-              f"{len(ids_to_fetch)} new/changed — fetching details...")
+        print(f"  {len(current) - len(ids_to_fetch)} PO(s) from cache, "
+              f"{len(ids_to_fetch)} to fetch...")
     else:
-        print(f"  All {len(current)} PO(s) loaded from cache — no API calls needed.")
+        print(f"  All {len(current)} PO(s) loaded from cache.")
 
-    # Step 3: fetch full record for each PO that needs it
+    # ── Step 3: fetch full record for each PO that needs it ───────────────────────
     DELAY      = 0.15
     RETRY_WAIT = 12
     MAX_RETRY  = 3
@@ -212,35 +231,19 @@ def fetch_completed_pos(api_key, force_refresh=False):
                 if attempt < MAX_RETRY:
                     time.sleep(RETRY_WAIT)
                 else:
-                    print(f"  Warning: could not fetch PO {po_id} after {MAX_RETRY} attempts — {e}")
+                    print(f"  Warning: could not fetch PO {po_id} — {e}")
             except Exception as e:
                 print(f"  Warning: could not fetch PO {po_id} — {e}")
                 break
         time.sleep(DELAY)
 
-    # Drop cached entries no longer in the target-status set (e.g. reopened POs)
+    # Drop stale entries and save cache
     stale = [k for k in list(cache.keys()) if int(k) not in current]
     for k in stale:
         del cache[k]
-
-    # Step 4: persist updated cache
     save_cache(cache)
 
-    # Assemble final list from cache (now fully up to date)
-    all_pos = list(cache.values())
-
-    # Sort: COMPLETED first, then PARTIALLY_FULFILLED; most recently updated first
-    def _sort_key(p):
-        status_order = 0 if (p.get("status") or "").upper() == "COMPLETED" else 1
-        raw = (p.get("updatedAt") or p.get("approvalDate") or "2000-01-01T00:00:00Z")
-        try:
-            ts = datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
-        except Exception:
-            ts = 0
-        return (status_order, -ts)
-
-    all_pos.sort(key=_sort_key)
-    return all_pos
+    return _sort_pos(list(cache.values()))
 
 # ── Helpers ───────────────────────────────────────────────────────────────────────
 def calc_po_total(po):
