@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MaintainX Dashboards</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #f1f5f9;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+    }
+
+    .logo {
+      font-size: .75rem;
+      font-weight: 700;
+      letter-spacing: .12em;
+      text-transform: uppercase;
+      color: #94a3b8;
+      margin-bottom: 8px;
+    }
+
+    h1 {
+      font-size: 1.6rem;
+      font-weight: 800;
+      color: #0f2d52;
+      margin-bottom: 6px;
+      text-align: center;
+    }
+
+    .subtitle {
+      font-size: .88rem;
+      color: #94a3b8;
+      margin-bottom: 40px;
+      text-align: center;
+    }
+
+    .cards {
+      display: flex;
+      gap: 20px;
+      flex-wrap: wrap;
+      justify-content: center;
+      max-width: 700px;
+      width: 100%;
+    }
+
+    .card {
+      background: #fff;
+      border: 1px solid #e2e8f0;
+      border-radius: 14px;
+      padding: 32px 28px;
+      flex: 1;
+      min-width: 260px;
+      max-width: 320px;
+      text-decoration: none;
+      color: inherit;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      transition: box-shadow .15s, transform .12s;
+      cursor: pointer;
+    }
+
+    .card:hover {
+      box-shadow: 0 8px 24px rgba(15, 45, 82, .12);
+      transform: translateY(-2px);
+    }
+
+    .card-icon {
+      width: 46px;
+      height: 46px;
+      border-radius: 10px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 1.4rem;
+    }
+
+    .card-icon.orange { background: #fff7ed; }
+    .card-icon.blue   { background: #eff6ff; }
+
+    .card-title {
+      font-size: 1.05rem;
+      font-weight: 700;
+      color: #0f2d52;
+      margin-top: 2px;
+    }
+
+    .card-desc {
+      font-size: .82rem;
+      color: #64748b;
+      line-height: 1.5;
+    }
+
+    .card-link {
+      margin-top: auto;
+      font-size: .8rem;
+      font-weight: 600;
+      color: #2563eb;
+      display: flex;
+      align-items: center;
+      gap: 4px;
+    }
+
+    .card-link::after { content: "→"; }
+
+    .note {
+      margin-top: 32px;
+      font-size: .75rem;
+      color: #cbd5e1;
+      text-align: center;
+    }
+  </style>
+</head>
+<body>
+
+  <div class="logo">Nvizzion · MaintainX</div>
+  <h1>Operations Dashboards</h1>
+  <p class="subtitle">Live data from your MaintainX account</p>
+
+  <div class="cards">
+
+    <a class="card" href="/wo">
+      <div class="card-icon orange">🔧</div>
+      <div class="card-title">Work Order Dashboard</div>
+      <div class="card-desc">
+        Open work orders ranked by priority score across all 10 production lines
+        (Lines 1–10 + other areas).
+      </div>
+      <div class="card-link">Open dashboard</div>
+    </a>
+
+    <a class="card" href="/po">
+      <div class="card-icon blue">📦</div>
+      <div class="card-title">Purchase Orders (AP)</div>
+      <div class="card-desc">
+        Completed and partially-fulfilled POs ready for Accounts Payable review,
+        with vendor, total, and approval date.
+      </div>
+      <div class="card-link">Open dashboard</div>
+    </a>
+
+  </div>
+
+  <p class="note">Data is fetched live · Reload the dashboard page to refresh</p>
+
+</body>
+</html>
