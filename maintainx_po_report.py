@@ -94,6 +94,7 @@ def _fetch_vendor_map(session):
         cursor = body.get("nextCursor")
         if not cursor or len(vendors) < PAGE_SIZE:
             break
+        time.sleep(0.5)
     return vendor_map
 
 
@@ -120,6 +121,21 @@ def load_cache():
         return data.get("pos", {})
     except Exception:
         return {}
+    
+
+def cache_age_minutes():
+    """Return how many minutes old the cache file is, or None if it doesn't exist."""
+    if not CACHE_FILE.exists():
+        return None
+    try:
+        data = json.loads(CACHE_FILE.read_text(encoding="utf-8"))
+        saved_at = data.get("saved_at")
+        if not saved_at:
+            return None
+        age = datetime.now(timezone.utc) - datetime.fromisoformat(saved_at)
+        return age.total_seconds() / 60
+    except Exception:
+        return None
 
 
 def save_cache(pos_by_id):
@@ -143,8 +159,15 @@ def fetch_completed_pos(api_key, force_refresh=False):
         "Content-Type": "application/json",
     })
 
-    # Load cache FIRST so we can fall back to it if rate-limited
+# Load cache FIRST so we can fall back to it if rate-limited
     cache: dict[str, dict] = {} if force_refresh else load_cache()
+
+    # If cache is less than 60 minutes old, serve it without any API calls
+    if not force_refresh and cache:
+        age = cache_age_minutes()
+        if age is not None and age < 60:
+            print(f"  Cache is {age:.0f}min old — serving without API calls.")
+            return _sort_pos(list(cache.values()))
 
     # ── Vendor map ────────────────────────────────────────────────────────────────
     print("  Fetching vendor list...")
@@ -156,6 +179,7 @@ def fetch_completed_pos(api_key, force_refresh=False):
             print("  Rate limited on vendor fetch — serving cached data.")
             return _sort_pos(list(cache.values()))
         raise
+    time.sleep(1.0)   # <-- add this line — let rate limit window recover
 
     # ── Step 1: scan list endpoint ────────────────────────────────────────────────
     print("  Scanning PO list...")
@@ -183,6 +207,7 @@ def fetch_completed_pos(api_key, force_refresh=False):
         cursor = body.get("nextCursor")
         if not cursor:
             break
+        time.sleep(0.5)
 
     print(f"  List scan complete — {len(current)} completed/partial PO(s) on server.")
 
@@ -204,7 +229,7 @@ def fetch_completed_pos(api_key, force_refresh=False):
         print(f"  All {len(current)} PO(s) loaded from cache.")
 
     # ── Step 3: fetch full record for each PO that needs it ───────────────────────
-    DELAY      = 0.15
+    DELAY      = 0.5
     RETRY_WAIT = 12
     MAX_RETRY  = 3
 
