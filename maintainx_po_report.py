@@ -135,7 +135,7 @@ def save_cache(pos_by_id):
 
 
 # ── Fetch POs ────────────────────────────────────────────────────────────────────
-def fetch_completed_pos(api_key, force_refresh=False):
+def fetch_completed_pos(api_key, force_refresh=False, fetch_vendors=True):
     """
     Fetch all COMPLETED and PARTIALLY_FULFILLED POs with full details.
 
@@ -144,6 +144,9 @@ def fetch_completed_pos(api_key, force_refresh=False):
       - Otherwise scan the list endpoint, compare to cache, only fetch
         records that are new or have changed status.
       - Falls back to stale cache if rate-limited during refresh.
+
+    fetch_vendors: if False, skip the vendor map API calls (web path).
+      Cached POs already carry vendorName; new ones will show "Vendor {id}".
     """
     session = requests.Session()
     session.headers.update({
@@ -161,18 +164,21 @@ def fetch_completed_pos(api_key, force_refresh=False):
             print(f"  Cache is {age:.0f}min old — serving without API calls.")
             return _sort_pos(list(cache.values()))
 
-    # ── Vendor map ────────────────────────────────────────────────────────────────
-    print("  Fetching vendor list...")
-    try:
-        vendor_map = _fetch_vendor_map(session)
-        print(f"  Found {len(vendor_map)} vendor(s).")
-    except requests.exceptions.HTTPError as e:
-        if e.response is not None and e.response.status_code == 429 and cache:
-            print("  Rate limited on vendor fetch — serving cached data.")
-            return _sort_pos(list(cache.values()))
-        raise
-
-    time.sleep(1.0)   # buffer before PO list scan to let rate-limit window recover
+    # ── Vendor map (optional — skipped on web path to save rate-limit quota) ──────
+    if fetch_vendors:
+        print("  Fetching vendor list...")
+        try:
+            vendor_map = _fetch_vendor_map(session)
+            print(f"  Found {len(vendor_map)} vendor(s).")
+        except requests.exceptions.HTTPError as e:
+            if e.response is not None and e.response.status_code == 429 and cache:
+                print("  Rate limited on vendor fetch — serving cached data.")
+                return _sort_pos(list(cache.values()))
+            raise
+        time.sleep(1.0)   # buffer before PO list scan
+    else:
+        vendor_map = {}
+        print("  Skipping vendor fetch (using cached vendor names).")
 
     # ── Step 1: scan list endpoint → {po_id (int): status (str)} ─────────────────
     print("  Scanning PO list...")

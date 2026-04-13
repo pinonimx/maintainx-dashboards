@@ -80,6 +80,52 @@ def _get_api_key():
     return None
 
 
+def _rate_limit_page():
+    """Shown when MaintainX API rate limit is hit. Auto-retries after 90 seconds."""
+    html = """<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><title>Loading...</title>
+<meta http-equiv="refresh" content="90">
+<style>
+  body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+       background:#f1f5f9;display:flex;align-items:center;
+       justify-content:center;height:100vh;margin:0;}
+  .card{background:#fff;border-radius:10px;padding:36px 44px;
+        box-shadow:0 2px 12px rgba(0,0,0,.08);max-width:480px;text-align:center;}
+  h1{color:#d97706;font-size:1.2rem;margin-bottom:12px;}
+  p{color:#6b7280;font-size:.9rem;line-height:1.6;}
+  .counter{font-size:2rem;font-weight:700;color:#0f2d52;margin:16px 0;}
+  a{color:#2563eb;text-decoration:none;}
+  .btn{display:inline-block;margin-top:16px;padding:8px 20px;
+       background:#2563eb;color:#fff;border-radius:6px;font-size:.85rem;
+       text-decoration:none;}
+</style>
+</head>
+<body>
+  <div class="card">
+    <h1>API Rate Limit Reached</h1>
+    <p>MaintainX limits how many requests can be made per minute.
+       This usually happens right after the Work Order dashboard loads.</p>
+    <div class="counter" id="t">90</div>
+    <p>Retrying automatically in <strong id="s">90</strong> seconds&hellip;</p>
+    <a href="/po" class="btn">Retry now</a>
+    &nbsp;
+    <a href="/">&#8592; Home</a>
+  </div>
+  <script>
+    var n=90;
+    var iv=setInterval(function(){
+      n--;
+      document.getElementById('t').textContent=n;
+      document.getElementById('s').textContent=n;
+      if(n<=0){clearInterval(iv);window.location.href='/po';}
+    },1000);
+  </script>
+</body>
+</html>"""
+    return Response(html, status=429, content_type="text/html")
+
+
 def _error_page(message, status=500):
     html = f"""<!DOCTYPE html>
 <html lang="en">
@@ -158,12 +204,14 @@ def po_dashboard():
         return Response(cached, content_type="text/html")
 
     try:
-        pos = po.fetch_completed_pos(api_key, force_refresh=False)
+        pos = po.fetch_completed_pos(api_key, force_refresh=False, fetch_vendors=False)
         generated_at = datetime.now().strftime("%A, %B %d %Y at %I:%M %p")
         html = po.build_po_html(pos, generated_at)
         _cache_set("po", html)
         return Response(html, content_type="text/html")
     except Exception as e:
+        if "429" in str(e):
+            return _rate_limit_page()
         return _error_page(f"Failed to fetch purchase orders from MaintainX: {e}")
 
 
