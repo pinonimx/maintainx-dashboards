@@ -158,7 +158,7 @@ def po_dashboard():
         return Response(cached, content_type="text/html")
 
     try:
-        pos = po.fetch_completed_pos(api_key, force_refresh=IS_VERCEL)
+        pos = po.fetch_completed_pos(api_key, force_refresh=False)
         generated_at = datetime.now().strftime("%A, %B %d %Y at %I:%M %p")
         html = po.build_po_html(pos, generated_at)
         _cache_set("po", html)
