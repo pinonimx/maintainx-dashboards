@@ -22,7 +22,7 @@ Running locally:
 import os
 import sys
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from flask import Flask, Response, render_template
 
@@ -39,6 +39,29 @@ if IS_VERCEL:
 import maintainx_dashboard as mxd
 
 app = Flask(__name__)
+
+# ── In-memory response cache ──────────────────────────────────────────────────────
+# Stores rendered HTML for each dashboard so repeated page loads within the TTL
+# window don't hammer the MaintainX API and trigger 429 rate-limit errors.
+# The cache lives in the serverless instance's memory — it resets on cold starts
+# but that's fine; the goal is just to absorb rapid back-to-back requests.
+CACHE_TTL_MINUTES = 5
+
+_cache: dict[str, dict] = {}   # key → {"html": str, "expires": datetime}
+
+
+def _cache_get(key: str):
+    entry = _cache.get(key)
+    if entry and datetime.now() < entry["expires"]:
+        return entry["html"]
+    return None
+
+
+def _cache_set(key: str, html: str):
+    _cache[key] = {
+        "html":    html,
+        "expires": datetime.now() + timedelta(minutes=CACHE_TTL_MINUTES),
+    }
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────────
@@ -92,7 +115,8 @@ def index():
 
 @app.route("/wo")
 def wo_dashboard():
-    """Fetch open work orders live and return the ranked HTML dashboard."""
+    """Fetch open work orders and return the ranked HTML dashboard.
+    Results are cached in memory for CACHE_TTL_MINUTES to avoid rate limiting."""
     api_key = _get_api_key()
     if not api_key:
         return _error_page(
@@ -100,12 +124,18 @@ def wo_dashboard():
             "Add it in Vercel's Environment Variables settings, then redeploy.",
             status=500,
         )
+
+    cached = _cache_get("wo")
+    if cached:
+        return Response(cached, content_type="text/html")
+
     try:
         wos = mxd.fetch_all_open_work_orders(api_key)
         lines_dict, non_line = mxd.compute_line_scores(wos)
         areas_dict = mxd.compute_area_scores(non_line)
         generated_at = datetime.now().strftime("%A, %B %d %Y at %I:%M %p")
         html = mxd.build_html(lines_dict, areas_dict, wos, generated_at)
+        _cache_set("wo", html)
         return Response(html, content_type="text/html")
     except Exception as e:
         return _error_page(f"Failed to fetch work orders from MaintainX: {e}")
@@ -113,7 +143,8 @@ def wo_dashboard():
 
 @app.route("/po")
 def po_dashboard():
-    """Fetch completed purchase orders live and return the AP HTML dashboard."""
+    """Fetch completed purchase orders and return the AP HTML dashboard.
+    Results are cached in memory for CACHE_TTL_MINUTES to avoid rate limiting."""
     api_key = _get_api_key()
     if not api_key:
         return _error_page(
@@ -121,12 +152,16 @@ def po_dashboard():
             "Add it in Vercel's Environment Variables settings, then redeploy.",
             status=500,
         )
+
+    cached = _cache_get("po")
+    if cached:
+        return Response(cached, content_type="text/html")
+
     try:
-        # force_refresh=True on Vercel since the cache doesn't persist across
-        # cold starts; locally the cache will be in /tmp for warm instances.
         pos = po.fetch_completed_pos(api_key, force_refresh=IS_VERCEL)
         generated_at = datetime.now().strftime("%A, %B %d %Y at %I:%M %p")
         html = po.build_po_html(pos, generated_at)
+        _cache_set("po", html)
         return Response(html, content_type="text/html")
     except Exception as e:
         return _error_page(f"Failed to fetch purchase orders from MaintainX: {e}")
