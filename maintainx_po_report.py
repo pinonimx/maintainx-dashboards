@@ -46,6 +46,43 @@ STATUS_BG = {
     "PARTIALLY_FULFILLED": "#fef9c3",
 }
 
+# ── Rate-limit helpers ────────────────────────────────────────────────────────────
+
+class RateLimitError(Exception):
+    """
+    Raised when the MaintainX API returns 429 and we cannot (or should not)
+    block inside the current serverless function execution.
+    """
+    def __init__(self, reset_seconds: int):
+        self.reset_seconds = reset_seconds
+        super().__init__(f"Rate limited by MaintainX API; reset in {reset_seconds}s")
+
+
+def _rl_get(session, url, params=None, timeout=30):
+    """
+    Rate-limit-aware GET wrapper.
+
+    * On 429  → raises RateLimitError(reset_seconds) immediately (no sleeping).
+    * On success → if X-Rate-Limit-Remaining == 0, sleep X-Rate-Limit-Reset + 1
+      so the NEXT call lands in a fresh window (capped at 65 s for safety).
+    * Returns the Response object on success.
+    """
+    resp = session.get(url, params=params, timeout=timeout)
+    if resp.status_code == 429:
+        reset = int(resp.headers.get("X-Rate-Limit-Reset", 62))
+        raise RateLimitError(reset)
+    resp.raise_for_status()
+
+    remaining = resp.headers.get("X-Rate-Limit-Remaining")
+    reset_hdr  = resp.headers.get("X-Rate-Limit-Reset")
+    if remaining is not None and int(remaining) == 0 and reset_hdr is not None:
+        wait = min(int(reset_hdr) + 1, 65)
+        print(f"  Rate-limit budget exhausted — sleeping {wait}s for window reset...")
+        time.sleep(wait)
+
+    return resp
+
+
 # ── API key ──────────────────────────────────────────────────────────────────────
 def get_api_key():
     key = os.environ.get("MAINTAINX_API_KEY", "").strip()
@@ -59,19 +96,19 @@ def get_api_key():
 
 # ── Vendor map ───────────────────────────────────────────────────────────────────
 def _fetch_vendor_map(session):
-    """Return {vendorId (int): name (str)} for all vendors in the org."""
+    """Return {vendorId (int): name (str)} for all vendors in the org.
+    Propagates RateLimitError so the caller can decide whether to fall back
+    to cached data or re-raise.
+    """
     vendor_map = {}
     cursor = None
     while True:
         params = {"limit": PAGE_SIZE}
         if cursor:
             params["cursor"] = cursor
-        try:
-            resp = session.get(f"{BASE_URL}/vendors", params=params, timeout=30)
-            resp.raise_for_status()
-            body = resp.json()
-        except Exception:
-            break
+        # _rl_get raises RateLimitError on 429 — let it propagate
+        resp = _rl_get(session, f"{BASE_URL}/vendors", params=params)
+        body = resp.json()
         vendors = next((v for v in body.values() if isinstance(v, list)), [])
         for v in vendors:
             vid = v.get("id")
@@ -135,18 +172,22 @@ def save_cache(pos_by_id):
 
 
 # ── Fetch POs ────────────────────────────────────────────────────────────────────
-def fetch_completed_pos(api_key, force_refresh=False, fetch_vendors=True):
+def fetch_completed_pos(api_key, force_refresh=False, fetch_vendors=True,
+                        fetch_details=True):
     """
-    Fetch all COMPLETED and PARTIALLY_FULFILLED POs with full details.
+    Fetch all COMPLETED and PARTIALLY_FULFILLED POs.
 
     Strategy (cache-aware):
-      - If cache is less than 60 minutes old, serve it with zero API calls.
-      - Otherwise scan the list endpoint, compare to cache, only fetch
-        records that are new or have changed status.
-      - Falls back to stale cache if rate-limited during refresh.
+      - If cache < 60 min old, serve with zero API calls.
+      - Otherwise: scan the list endpoint (1–3 calls), update cache.
 
-    fetch_vendors: if False, skip the vendor map API calls (web path).
-      Cached POs already carry vendorName; new ones will show "Vendor {id}".
+    fetch_vendors:  if False, skip /vendors calls (saves rate-limit quota).
+    fetch_details:  if False (web path), skip per-PO detail fetches entirely.
+                    List-level data is stored for new/unknown POs so the
+                    dashboard renders immediately.  Totals show "—" for POs
+                    that have never been detail-fetched; cached detail data
+                    (vendor names, item totals) is reused when available.
+                    Use the /po/refresh route to trigger a full detail fetch.
     """
     session = requests.Session()
     session.headers.update({
@@ -154,7 +195,7 @@ def fetch_completed_pos(api_key, force_refresh=False, fetch_vendors=True):
         "Content-Type": "application/json",
     })
 
-    # Load cache FIRST so we can (a) serve it if fresh, (b) fall back on 429
+    # Load cache FIRST — (a) serve fresh, (b) fall back on 429, (c) enrich list data
     cache: dict[str, dict] = {} if force_refresh else load_cache()
 
     # Serve from cache if it is less than 60 minutes old — zero API calls
@@ -170,6 +211,11 @@ def fetch_completed_pos(api_key, force_refresh=False, fetch_vendors=True):
         try:
             vendor_map = _fetch_vendor_map(session)
             print(f"  Found {len(vendor_map)} vendor(s).")
+        except RateLimitError:
+            if cache:
+                print("  Rate limited on vendor fetch — serving cached data.")
+                return _sort_pos(list(cache.values()))
+            raise
         except requests.exceptions.HTTPError as e:
             if e.response is not None and e.response.status_code == 429 and cache:
                 print("  Rate limited on vendor fetch — serving cached data.")
@@ -180,21 +226,22 @@ def fetch_completed_pos(api_key, force_refresh=False, fetch_vendors=True):
         vendor_map = {}
         print("  Skipping vendor fetch (using cached vendor names).")
 
-    # ── Step 1: scan list endpoint → {po_id (int): status (str)} ─────────────────
+    # ── Step 1: scan list endpoint → {po_id: status} + capture full list items ───
     print("  Scanning PO list...")
-    current: dict[int, str] = {}
+    current: dict[int, str] = {}      # id → status
+    list_items: dict[int, dict] = {}  # id → full list-level record
     cursor = None
     while True:
         params = {"limit": PAGE_SIZE}
         if cursor:
             params["cursor"] = cursor
-        resp = session.get(f"{BASE_URL}/purchaseorders", params=params, timeout=30)
-        if resp.status_code == 429:
+        try:
+            resp = _rl_get(session, f"{BASE_URL}/purchaseorders", params=params)
+        except RateLimitError:
             if cache:
                 print("  Rate limited on PO scan — serving cached data.")
                 return _sort_pos(list(cache.values()))
-            resp.raise_for_status()
-        resp.raise_for_status()
+            raise   # propagates so app.py shows accurate countdown
         body = resp.json()
         batch = next((v for k, v in body.items() if isinstance(v, list)), None)
         if not batch:
@@ -202,33 +249,70 @@ def fetch_completed_pos(api_key, force_refresh=False, fetch_vendors=True):
         for po_item in batch:
             status = (po_item.get("status") or "").upper().strip()
             if status in ALL_FETCH:
-                current[int(po_item["id"])] = status
+                po_id = int(po_item["id"])
+                current[po_id] = status
+                list_items[po_id] = po_item   # keep full summary for list-only mode
         cursor = body.get("nextCursor")
         if not cursor:
             break
-        time.sleep(0.5)   # rate-limit buffer between PO list pages
+        time.sleep(0.5)
 
     print(f"  List scan complete — {len(current)} completed/partial PO(s) on server.")
 
-    # ── Step 2: decide what to fetch ──────────────────────────────────────────────
-    ids_to_fetch = []
-    for po_id, status in current.items():
-        key = str(po_id)
-        cached = cache.get(key)
-        if cached is None or (cached.get("status") or "").upper() != status:
-            ids_to_fetch.append(po_id)
+    # ── Step 2a: list-only mode (web path) ────────────────────────────────────────
+    if not fetch_details:
+        for po_id, list_item in list_items.items():
+            key = str(po_id)
+            cached = cache.get(key)
+            if cached is None:
+                # Brand-new PO: store list-level record.
+                # calc_po_total returns None when "items" absent → shows "—"
+                entry = dict(list_item)
+                vid = entry.get("vendorId")
+                entry["vendorName"] = (
+                    vendor_map.get(int(vid), f"Vendor {vid}") if vid else "Unknown Vendor"
+                )
+                cache[key] = entry
+            else:
+                # Update mutable fields from the fresh list scan
+                cached["status"]       = list_item.get("status", cached.get("status"))
+                cached["updatedAt"]    = list_item.get("updatedAt", cached.get("updatedAt"))
+                cached["approvalDate"] = list_item.get("approvalDate", cached.get("approvalDate"))
+                cached["dueDate"]      = list_item.get("dueDate", cached.get("dueDate"))
+                cached["note"]         = list_item.get("note", cached.get("note"))
 
+        # Drop POs no longer on server
+        stale = [k for k in list(cache.keys()) if int(k) not in current]
+        for k in stale:
+            del cache[k]
+        save_cache(cache)
+        print(f"  List-only mode: {len(cache)} PO(s) ready (no detail fetches).")
+        return _sort_pos(list(cache.values()))
+
+    # ── Step 2b: decide which POs need a full detail fetch ────────────────────────
+    ids_to_fetch = []
     if force_refresh:
         ids_to_fetch = list(current.keys())
         print("  --refresh: ignoring cache, re-fetching all POs.")
-    elif ids_to_fetch:
-        print(f"  {len(current) - len(ids_to_fetch)} PO(s) from cache, "
-              f"{len(ids_to_fetch)} to fetch...")
     else:
-        print(f"  All {len(current)} PO(s) loaded from cache.")
+        for po_id, status in current.items():
+            key = str(po_id)
+            cached = cache.get(key)
+            needs_fetch = (
+                cached is None                                            # never fetched
+                or "items" not in cached                                  # only list data
+                or (cached.get("status") or "").upper() != status         # status changed
+            )
+            if needs_fetch:
+                ids_to_fetch.append(po_id)
+        if ids_to_fetch:
+            print(f"  {len(current) - len(ids_to_fetch)} PO(s) from cache, "
+                  f"{len(ids_to_fetch)} to fetch...")
+        else:
+            print(f"  All {len(current)} PO(s) loaded from cache.")
 
     # ── Step 3: fetch full record for each PO that needs it ───────────────────────
-    DELAY      = 0.5    # seconds between individual PO fetches
+    DELAY      = 0.5
     RETRY_WAIT = 12
     MAX_RETRY  = 3
 
@@ -237,20 +321,20 @@ def fetch_completed_pos(api_key, force_refresh=False, fetch_vendors=True):
             print(f"  ...fetched {i}/{len(ids_to_fetch)}")
         for attempt in range(1, MAX_RETRY + 1):
             try:
-                resp = session.get(f"{BASE_URL}/purchaseorders/{po_id}", timeout=30)
-                if resp.status_code == 429:
-                    wait = int(resp.headers.get("Retry-After", RETRY_WAIT))
-                    print(f"  Rate limited — waiting {wait}s before retrying...")
-                    time.sleep(wait)
-                    continue
-                resp.raise_for_status()
+                resp = _rl_get(session, f"{BASE_URL}/purchaseorders/{po_id}")
                 body = resp.json()
                 po = body.get("purchaseOrder") or body
                 if isinstance(po, dict):
                     vid = po.get("vendorId")
-                    po["vendorName"] = vendor_map.get(int(vid), f"Vendor {vid}") if vid else "Unknown Vendor"
+                    po["vendorName"] = (
+                        vendor_map.get(int(vid), f"Vendor {vid}") if vid else "Unknown Vendor"
+                    )
                     cache[str(po_id)] = po
                 break
+            except RateLimitError as e:
+                wait = min(e.reset_seconds + 1, 65)
+                print(f"  Rate limited on PO {po_id} (attempt {attempt}) — sleeping {wait}s...")
+                time.sleep(wait)
             except requests.exceptions.HTTPError as e:
                 if attempt < MAX_RETRY:
                     time.sleep(RETRY_WAIT)
@@ -261,7 +345,7 @@ def fetch_completed_pos(api_key, force_refresh=False, fetch_vendors=True):
                 break
         time.sleep(DELAY)
 
-    # Drop stale entries and save updated cache
+    # Drop stale entries and save
     stale = [k for k in list(cache.keys()) if int(k) not in current]
     for k in stale:
         del cache[k]
@@ -430,6 +514,7 @@ def build_po_html(pos, generated_at):
       <div class="sub">Generated {generated_at}</div>
     </div>
   </div>
+  <a href="/po/refresh" title="Fetch full PO details (vendor names &amp; totals)" style="font-size:.8rem;color:#2563eb;text-decoration:none;padding:5px 12px;border:1px solid #bfdbfe;border-radius:6px;white-space:nowrap;background:#eff6ff;">&#8635; Refresh Data</a>
 </div>
 
 <div class="kpi-strip">

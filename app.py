@@ -5,13 +5,13 @@ Flask wrapper that serves the Work Order and Purchase Order dashboards
 from the MaintainX API with two-layer caching:
 
   Layer 1 — in-memory (5 min TTL):  absorbs rapid back-to-back requests
-  Layer 2 — file cache (60 min TTL): survives cold starts, prevents both
-            dashboards from hammering the API at the same time
+  Layer 2 — file cache (60 min TTL): survives cold starts on warm containers
 
 Routes:
-    GET /   -- Home page
-    GET /wo -- Open Work Order dashboard
-    GET /po -- Purchase Orders (AP) dashboard
+    GET /           -- Home page
+    GET /wo         -- Open Work Order dashboard
+    GET /po         -- Purchase Orders (AP) dashboard (list-only, ~2 API calls)
+    GET /po/refresh -- Trigger a full PO detail refresh (fetches every PO individually)
 """
 
 import os
@@ -100,24 +100,28 @@ def _get_api_key():
     return None
 
 
-def _rate_limit_page():
-    """Shown when MaintainX API is rate-limited. Auto-retries after 90 seconds."""
-    html = """<!DOCTYPE html>
+def _rate_limit_page(wait_seconds=65):
+    """Shown when MaintainX API is rate-limited.
+    wait_seconds: the X-Rate-Limit-Reset value from the 429 response.
+    Adds a 5-second buffer and auto-retries /po when the countdown reaches 0.
+    """
+    countdown = max(int(wait_seconds) + 5, 15)  # add buffer; minimum 15 s
+    html = f"""<!DOCTYPE html>
 <html lang="en">
 <head><meta charset="UTF-8"><title>Loading...</title>
 <style>
-  body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+  body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
        background:#f1f5f9;display:flex;align-items:center;
-       justify-content:center;height:100vh;margin:0;}
-  .card{background:#fff;border-radius:10px;padding:36px 44px;
-        box-shadow:0 2px 12px rgba(0,0,0,.08);max-width:480px;text-align:center;}
-  h1{color:#d97706;font-size:1.2rem;margin-bottom:12px;}
-  p{color:#6b7280;font-size:.9rem;line-height:1.6;}
-  .counter{font-size:2.5rem;font-weight:700;color:#0f2d52;margin:16px 0;}
-  .btn{display:inline-block;margin-top:16px;padding:8px 20px;
+       justify-content:center;height:100vh;margin:0;}}
+  .card{{background:#fff;border-radius:10px;padding:36px 44px;
+        box-shadow:0 2px 12px rgba(0,0,0,.08);max-width:480px;text-align:center;}}
+  h1{{color:#d97706;font-size:1.2rem;margin-bottom:12px;}}
+  p{{color:#6b7280;font-size:.9rem;line-height:1.6;}}
+  .counter{{font-size:2.5rem;font-weight:700;color:#0f2d52;margin:16px 0;}}
+  .btn{{display:inline-block;margin-top:16px;padding:8px 20px;
        background:#2563eb;color:#fff;border-radius:6px;font-size:.85rem;
-       text-decoration:none;}
-  a{color:#2563eb;text-decoration:none;}
+       text-decoration:none;}}
+  a{{color:#2563eb;text-decoration:none;}}
 </style>
 </head>
 <body>
@@ -125,19 +129,19 @@ def _rate_limit_page():
     <h1>API Rate Limit Reached</h1>
     <p>MaintainX limits API requests per minute. This typically happens
        right after the Work Order dashboard loads for the first time.</p>
-    <div class="counter" id="t">90</div>
-    <p>Auto-retrying in <strong id="s">90</strong> seconds&hellip;</p>
+    <div class="counter" id="t">{countdown}</div>
+    <p>Auto-retrying in <strong id="s">{countdown}</strong> seconds&hellip;</p>
     <a href="/po" class="btn">Retry now</a>
     &nbsp;&nbsp;
     <a href="/">&#8592; Home</a>
   </div>
   <script>
-    var n=90;
-    var iv=setInterval(function(){
+    var n={countdown};
+    var iv=setInterval(function(){{
       n--;document.getElementById('t').textContent=n;
       document.getElementById('s').textContent=n;
-      if(n<=0){clearInterval(iv);window.location.href='/po';}
-    },1000);
+      if(n<=0){{clearInterval(iv);window.location.href='/po';}}
+    }},1000);
   </script>
 </body>
 </html>"""
@@ -229,17 +233,107 @@ def po_dashboard():
     if html:
         return Response(html, content_type="text/html")
 
-    # Layers 2+3 handled inside fetch_completed_pos (file cache + API)
+    # Layers 2+3 handled inside fetch_completed_pos (file cache + API).
+    # fetch_details=False: list-scan only (~1–3 API calls), no per-PO detail fetches.
+    # Cached detail data (vendor names, item totals) is reused when available.
+    # Use /po/refresh to trigger a full detail rebuild.
     try:
-        pos = po.fetch_completed_pos(api_key, force_refresh=False, fetch_vendors=False)
+        pos = po.fetch_completed_pos(
+            api_key, force_refresh=False, fetch_vendors=False, fetch_details=False
+        )
         generated_at = datetime.now().strftime("%A, %B %d %Y at %I:%M %p")
         html = po.build_po_html(pos, generated_at)
         _mem_set("po", html)
         return Response(html, content_type="text/html")
+    except po.RateLimitError as e:
+        return _rate_limit_page(e.reset_seconds)
     except Exception as e:
         if "429" in str(e):
-            return _rate_limit_page()
+            return _rate_limit_page(65)
         return _error_page(f"Failed to fetch purchase orders from MaintainX: {e}")
+
+
+@app.route("/po/refresh")
+def po_refresh():
+    """
+    Trigger a full PO detail refresh: fetches every PO individually to populate
+    vendor names and line-item totals.  Only use this once rate-limit budget is
+    available (i.e. not immediately after loading the WO dashboard).
+    Results are saved to /tmp/po_cache.json for subsequent /po requests.
+    """
+    api_key = _get_api_key()
+    if not api_key:
+        return _error_page("MAINTAINX_API_KEY is not configured.", status=500)
+
+    try:
+        pos = po.fetch_completed_pos(
+            api_key, force_refresh=False, fetch_vendors=False, fetch_details=True
+        )
+        generated_at = datetime.now().strftime("%A, %B %d %Y at %I:%M %p")
+        html = po.build_po_html(pos, generated_at)
+        # Bust caches so next /po request picks up the fresh data
+        _mem_cache.pop("po", None)
+        _mem_set("po", html)
+        # Return the full dashboard with a banner indicating it was just refreshed
+        banner = (
+            '<div style="background:#dcfce7;border:1px solid #16a34a;border-radius:8px;'
+            'padding:10px 18px;margin:12px 28px;font-size:.85rem;color:#166534;">'
+            '&#10003; Full refresh complete — vendor names and totals are now up to date.'
+            '</div>'
+        )
+        # Insert banner after <body>
+        html_with_banner = html.replace("<body>", "<body>" + banner, 1)
+        return Response(html_with_banner, content_type="text/html")
+    except po.RateLimitError as e:
+        return _rate_limit_refresh_page(e.reset_seconds)
+    except Exception as e:
+        if "429" in str(e):
+            return _rate_limit_refresh_page(65)
+        return _error_page(f"Refresh failed: {e}")
+
+
+def _rate_limit_refresh_page(wait_seconds=65):
+    """Shown when /po/refresh hits the rate limit."""
+    countdown = max(int(wait_seconds) + 5, 15)
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><title>Refresh rate limited</title>
+<style>
+  body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+       background:#f1f5f9;display:flex;align-items:center;
+       justify-content:center;height:100vh;margin:0;}}
+  .card{{background:#fff;border-radius:10px;padding:36px 44px;
+        box-shadow:0 2px 12px rgba(0,0,0,.08);max-width:480px;text-align:center;}}
+  h1{{color:#d97706;font-size:1.2rem;margin-bottom:12px;}}
+  p{{color:#6b7280;font-size:.9rem;line-height:1.6;}}
+  .counter{{font-size:2.5rem;font-weight:700;color:#0f2d52;margin:16px 0;}}
+  .btn{{display:inline-block;margin-top:16px;padding:8px 20px;
+       background:#2563eb;color:#fff;border-radius:6px;font-size:.85rem;
+       text-decoration:none;}}
+  a{{color:#2563eb;text-decoration:none;}}
+</style>
+</head>
+<body>
+  <div class="card">
+    <h1>Rate Limit Reached — Refresh Queued</h1>
+    <p>The API rate limit was hit during the full refresh. The page will
+       auto-retry in <strong id="s">{countdown}</strong> seconds.</p>
+    <div class="counter" id="t">{countdown}</div>
+    <a href="/po/refresh" class="btn">Retry refresh now</a>
+    &nbsp;&nbsp;
+    <a href="/po">&#8592; Back to dashboard</a>
+  </div>
+  <script>
+    var n={countdown};
+    var iv=setInterval(function(){{
+      n--;document.getElementById('t').textContent=n;
+      document.getElementById('s').textContent=n;
+      if(n<=0){{clearInterval(iv);window.location.href='/po/refresh';}}
+    }},1000);
+  </script>
+</body>
+</html>"""
+    return Response(html, status=200, content_type="text/html")
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────────
