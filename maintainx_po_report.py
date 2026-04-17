@@ -669,9 +669,19 @@ def _sanitize(s):
 
 
 def _get_csv_field(row, *keys):
-    """Try multiple column name variants, return first non-empty sanitized value."""
+    """
+    Try multiple column name variants (exact match first, then case-insensitive).
+    Returns the first non-empty sanitized value found, or "" if nothing matches.
+    """
+    # Exact match pass
     for k in keys:
         v = (row.get(k) or "").strip()
+        if v:
+            return _sanitize(v)
+    # Case-insensitive fallback — builds once per call, cheap for short rows
+    row_lower = {rk.lower(): rv for rk, rv in row.items()}
+    for k in keys:
+        v = (row_lower.get(k.lower()) or "").strip()
         if v:
             return _sanitize(v)
     return ""
@@ -691,9 +701,9 @@ def _extract_line_items(rows):
         unit_cost = _get_csv_field(row,
             "Unit Cost", "Unit Price", "Price")
         qty_ord   = _get_csv_field(row,
-            "Quantity Ordered", "Qty Ordered", "Quantity", "Ordered Qty", "Qty")
+            "Ordered", "Quantity Ordered", "Qty Ordered", "Ordered Qty", "Quantity", "Qty")
         qty_rcv   = _get_csv_field(row,
-            "Quantity Received", "Qty Received", "Received Qty", "Received")
+            "Received", "Quantity Received", "Qty Received", "Received Qty")
         line_tot  = _get_csv_field(row,
             "Line Total", "Total Cost", "Ordered Cost", "Line Cost", "Amount")
 
@@ -841,7 +851,7 @@ def build_receipt_pdf(po_dict):
     right_items = [("Status",         status_lbl, None   ),
                    ("Approved",       approved,   None   ),
                    ("Due Date",       due,        None   ),
-                   ("Posted Date",           paid_date,  C_GREEN)]
+                   ("Posted Date",    paid_date,  C_GREEN)]
 
     for i, (label, value, color) in enumerate(left_items):
         pdf.set_xy(lx, sy + i * LH)
