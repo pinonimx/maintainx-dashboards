@@ -20,6 +20,12 @@ import requests
 from pathlib import Path
 from datetime import datetime, timezone
 
+try:
+    from fpdf import FPDF as _FPDF
+    _FPDF_AVAILABLE = True
+except ImportError:
+    _FPDF_AVAILABLE = False
+
 # ── Config ──────────────────────────────────────────────────────────────────────
 SCRIPT_DIR   = Path(__file__).parent
 BASE_URL     = "https://api.getmaintainx.com/v1"
@@ -206,6 +212,12 @@ def fetch_pos_from_csv(api_key):
 
         invoice_status = (first.get("Invoice Status") or "").strip() or None
 
+        # Approver name — try common column name variants
+        approver_name = (
+            first.get("Approver Name") or first.get("Approved By") or
+            first.get("Approver") or ""
+        ).strip()
+
         pos_by_id[po_id] = {
             "id":            int(po_id),
             "overrideNumber": (first.get("Purchase Order #") or "").strip(),
@@ -220,6 +232,8 @@ def fetch_pos_from_csv(api_key):
             "dueDate":       _parse_csv_date(first.get("Due Date")),
             "invoice_status": invoice_status,
             "_total":        total,   # pre-computed; picked up by calc_po_total()
+            "approver_name": approver_name,
+            "line_items":    _extract_line_items(rows),
         }
 
     # ── Enrich POs with vendor ID and Infor Vendor # ──────────────────────────────
@@ -619,6 +633,255 @@ def po_number(po):
     return f"ID {po.get('id', '?')}"
 
 
+def _get_csv_field(row, *keys):
+    """Try multiple column name variants, return first non-empty value."""
+    for k in keys:
+        v = (row.get(k) or "").strip()
+        if v:
+            return v
+    return ""
+
+
+def _extract_line_items(rows):
+    """
+    Build a list of line-item dicts from the CSV rows belonging to one PO.
+    MaintainX PO CSV has one row per line item; PO-level fields repeat on each row.
+    """
+    items = []
+    for i, row in enumerate(rows, 1):
+        part_name = _get_csv_field(row,
+            "Part", "Item", "Description", "Part Name", "Item Name", "Line Name")
+        part_num  = _get_csv_field(row,
+            "Part #", "Part Number", "SKU", "Part No", "Part No.")
+        unit_cost = _get_csv_field(row,
+            "Unit Cost", "Unit Price", "Price")
+        qty_ord   = _get_csv_field(row,
+            "Quantity Ordered", "Qty Ordered", "Quantity", "Ordered Qty", "Qty")
+        qty_rcv   = _get_csv_field(row,
+            "Quantity Received", "Qty Received", "Received Qty", "Received")
+        line_tot  = _get_csv_field(row,
+            "Line Total", "Total Cost", "Ordered Cost", "Line Cost", "Amount")
+
+        def _to_float(s):
+            try:
+                return round(float(s.replace(",", "").replace("$", "").strip()), 4) if s else None
+            except (ValueError, TypeError):
+                return None
+
+        uc = _to_float(unit_cost)
+        qo = _to_float(qty_ord)
+        qr = _to_float(qty_rcv)
+        lt = _to_float(line_tot)
+
+        # Compute line total if missing
+        if lt is None and uc is not None and qo is not None:
+            lt = round(uc * qo, 2)
+
+        # Skip rows with no meaningful content (blank line item rows)
+        if not part_name and not part_num and uc is None and qo is None:
+            continue
+
+        items.append({
+            "line_number":   i,
+            "part_name":     part_name,
+            "part_number":   part_num,
+            "unit_cost":     uc,
+            "qty_ordered":   qo,
+            "qty_received":  qr,
+            "line_total":    lt,
+        })
+    return items
+
+
+def _fmt_qty(val):
+    """Format a quantity: integer if whole number, else up to 2 decimal places."""
+    if val is None:
+        return "—"
+    try:
+        f = float(val)
+        return str(int(f)) if f == int(f) else f"{f:.2f}"
+    except (ValueError, TypeError):
+        return str(val)
+
+
+def build_receipt_pdf(po_dict):
+    """
+    Generate a PDF payment receipt for a single PO.
+    Returns raw PDF bytes for streaming as a file download.
+    Requires fpdf2 (pure Python — no system dependencies, works on Vercel).
+    """
+    if not _FPDF_AVAILABLE:
+        raise RuntimeError(
+            "fpdf2 is not installed. Add 'fpdf2>=2.7.0' to requirements.txt and redeploy."
+        )
+
+    # ── Colours ──────────────────────────────────────────────────────────────────
+    C_BLUE  = (15,  45,  82)
+    C_GREEN = (22,  163, 74)
+    C_LGRAY = (248, 250, 252)
+    C_DGRAY = (107, 114, 128)
+    C_BORD  = (226, 232, 240)
+    C_WHITE = (255, 255, 255)
+    C_BLACK = (30,  41,  59)
+
+    pdf = _FPDF(orientation="P", unit="mm", format="A4")
+    pdf.set_margins(15, 15, 15)
+    pdf.set_auto_page_break(auto=True, margin=20)
+    pdf.add_page()
+    pw = pdf.w - 30   # usable page width (A4 210 mm − 30 mm margins)
+
+    # ── Header band ───────────────────────────────────────────────────────────────
+    pdf.set_fill_color(*C_BLUE)
+    pdf.set_text_color(*C_WHITE)
+    pdf.set_font("Helvetica", "B", 18)
+    pdf.cell(pw, 11, "PAYMENT RECEIPT", border=0, align="C", fill=True)
+    pdf.ln(11)
+    pdf.set_font("Helvetica", "", 9)
+    pdf.cell(pw, 6, "Accounts Payable Department", border=0, align="C", fill=True)
+    pdf.ln(8)
+
+    # ── Info grid (2-column) ──────────────────────────────────────────────────────
+    pnum       = po_number(po_dict)
+    vendor     = po_dict.get("vendorName", "Unknown Vendor")
+    infor_num  = po_dict.get("infor_vendor_number") or "—"
+    approver   = po_dict.get("approver_name") or "—"
+    status_lbl = STATUS_LABEL.get((po_dict.get("status") or "").upper(),
+                                   po_dict.get("status", "—"))
+    approved   = fmt_date(po_dict.get("approvalDate") or po_dict.get("updatedAt"))
+    due        = fmt_date(po_dict.get("dueDate"))
+    paid_raw   = po_dict.get("paid_at")
+    paid_date  = (fmt_date(paid_raw) if paid_raw
+                  else datetime.now().strftime("%b %d, %Y"))
+
+    lx    = pdf.l_margin
+    rx    = lx + pw / 2 + 2
+    half  = pw / 2 - 2
+    sy    = pdf.get_y()
+    LH    = 6        # row height in info grid
+    LBL_W = 30       # label column width
+
+    left_items  = [("PO #",           pnum,       None   ),
+                   ("Vendor",         vendor,     None   ),
+                   ("Infor Vendor #", infor_num,  None   ),
+                   ("Approver",       approver,   None   )]
+    right_items = [("Status",         status_lbl, None   ),
+                   ("Approved",       approved,   None   ),
+                   ("Due Date",       due,        None   ),
+                   ("Paid",           paid_date,  C_GREEN)]
+
+    for i, (label, value, color) in enumerate(left_items):
+        pdf.set_xy(lx, sy + i * LH)
+        pdf.set_font("Helvetica", "B", 8)
+        pdf.set_text_color(*C_DGRAY)
+        pdf.cell(LBL_W, LH, label.upper(), border=0)
+        pdf.set_font("Helvetica", "", 9)
+        pdf.set_text_color(*(color or C_BLACK))
+        pdf.cell(half - LBL_W, LH, str(value or "—"), border=0)
+
+    for i, (label, value, color) in enumerate(right_items):
+        pdf.set_xy(rx, sy + i * LH)
+        pdf.set_font("Helvetica", "B", 8)
+        pdf.set_text_color(*C_DGRAY)
+        pdf.cell(22, LH, label.upper(), border=0)
+        pdf.set_font("Helvetica", "", 9)
+        pdf.set_text_color(*(color or C_BLACK))
+        pdf.cell(half - 22, LH, str(value or "—"), border=0)
+
+    pdf.set_text_color(*C_BLACK)
+    pdf.set_y(sy + len(left_items) * LH + 4)
+
+    # ── Divider ───────────────────────────────────────────────────────────────────
+    pdf.set_draw_color(*C_BORD)
+    pdf.line(lx, pdf.get_y(), lx + pw, pdf.get_y())
+    pdf.ln(3)
+
+    # ── Line items section header ─────────────────────────────────────────────────
+    pdf.set_font("Helvetica", "B", 8)
+    pdf.set_text_color(*C_DGRAY)
+    pdf.cell(pw, 5, "LINE ITEMS", border=0)
+    pdf.ln(6)
+
+    # ── Line items table ──────────────────────────────────────────────────────────
+    line_items = po_dict.get("line_items") or []
+    fixed_w = 8 + 28 + 16 + 16 + 24 + 24   # sum of all fixed columns
+    desc_w  = pw - fixed_w
+    col_w   = [8, desc_w, 28, 16, 16, 24, 24]
+    headers = ["#", "Description", "Part #", "Qty Ord", "Qty Rcv", "Unit Cost", "Line Total"]
+    aligns  = ["C", "L",           "L",      "R",       "R",       "R",         "R"         ]
+    TH      = 6   # table row height
+
+    # Header row
+    pdf.set_fill_color(*C_BLUE)
+    pdf.set_text_color(*C_WHITE)
+    pdf.set_font("Helvetica", "B", 7.5)
+    for w, h_text, a in zip(col_w, headers, aligns):
+        pdf.cell(w, TH, h_text, border=0, align=a, fill=True)
+    pdf.ln(TH)
+
+    # Data rows
+    pdf.set_font("Helvetica", "", 8)
+    for idx, item in enumerate(line_items):
+        fill = (idx % 2 == 1)
+        pdf.set_fill_color(*C_LGRAY)
+        pdf.set_text_color(*C_BLACK)
+        row_data = [
+            str(item.get("line_number", idx + 1)),
+            (item.get("part_name")   or "")[:60],
+            (item.get("part_number") or "")[:18],
+            _fmt_qty(item.get("qty_ordered")),
+            _fmt_qty(item.get("qty_received")),
+            fmt_currency(item.get("unit_cost")),
+            fmt_currency(item.get("line_total")),
+        ]
+        for w, d, a in zip(col_w, row_data, aligns):
+            pdf.cell(w, TH, d, border=0, align=a, fill=fill)
+        pdf.ln(TH)
+
+    if not line_items:
+        pdf.set_text_color(*C_DGRAY)
+        pdf.set_font("Helvetica", "I", 8)
+        pdf.cell(pw, TH, "No line item data available.", border=0, align="C")
+        pdf.ln(TH)
+
+    # ── Total bar ─────────────────────────────────────────────────────────────────
+    pdf.ln(1)
+    total_str   = fmt_currency(calc_po_total(po_dict))
+    tot_label_w = pw - 40
+    pdf.set_fill_color(*C_BLUE)
+    pdf.set_text_color(*C_WHITE)
+    pdf.set_font("Helvetica", "B", 9)
+    pdf.cell(tot_label_w, 8, "ORDER TOTAL", border=0, align="R", fill=True)
+    pdf.set_fill_color(*C_GREEN)
+    pdf.set_font("Helvetica", "B", 10)
+    pdf.cell(40, 8, total_str, border=0, align="C", fill=True)
+    pdf.ln(8)
+
+    # ── Notes ─────────────────────────────────────────────────────────────────────
+    notes = (po_dict.get("note") or "").strip()
+    if notes:
+        pdf.ln(3)
+        pdf.set_font("Helvetica", "B", 8)
+        pdf.set_text_color(*C_DGRAY)
+        pdf.cell(pw, 5, "NOTES", border=0)
+        pdf.ln(5)
+        pdf.set_font("Helvetica", "", 8.5)
+        pdf.set_text_color(*C_BLACK)
+        pdf.multi_cell(pw, 5, notes)
+
+    # ── Footer ────────────────────────────────────────────────────────────────────
+    pdf.ln(4)
+    pdf.set_draw_color(*C_BORD)
+    pdf.line(lx, pdf.get_y(), lx + pw, pdf.get_y())
+    pdf.ln(2)
+    pdf.set_text_color(*C_DGRAY)
+    pdf.set_font("Helvetica", "", 7.5)
+    generated = datetime.now().strftime("%B %d, %Y at %I:%M %p")
+    pdf.cell(pw / 2, 4, f"Receipt generated: {generated}", border=0)
+    pdf.cell(pw / 2, 4, f"PO ID: {po_dict.get('id', '')}", border=0, align="R")
+
+    return bytes(pdf.output())
+
+
 def _esc(s):
     """HTML-escape a string."""
     return (str(s)
@@ -702,11 +965,19 @@ def build_po_html(pos, generated_at):
             inv_opts = ('<option value="" selected>&#8212; Not Set</option>'
                         '<option value="Unpaid">Unpaid</option>')
 
+        # Download Receipt button — shown for already-Paid rows (server-rendered)
+        receipt_btn = (
+            f'<a href="/po/receipt/{po_id}" '
+            f'style="display:inline-block;padding:3px 8px;background:#16a34a;color:#fff;'
+            f'border-radius:5px;font-size:.75rem;font-weight:500;text-decoration:none;'
+            f'margin-left:4px" title="Download PDF receipt">&#128464;&nbsp;Receipt</a>'
+        ) if inv_raw == "Paid" else ""
+
         rows_html += f"""
         <tr class="po-row" data-status="{status}" data-vendor="{vendor}" data-invoice-status="{inv_raw}">
           <td style="font-weight:600;color:#1e40af;white-space:nowrap">{pnum}</td>
           <td style="white-space:nowrap">
-            <select id="inv-{po_id}" style="border:1px solid #d1d5db;border-radius:5px;padding:3px 7px;font-size:.78rem;color:#374151;background:#fff;margin-right:4px">{inv_opts}</select><button onclick="saveInvStatus({po_id},this)" style="padding:3px 8px;background:#2563eb;color:#fff;border:none;border-radius:5px;font-size:.75rem;cursor:pointer;font-weight:500">Save</button>
+            <select id="inv-{po_id}" style="border:1px solid #d1d5db;border-radius:5px;padding:3px 7px;font-size:.78rem;color:#374151;background:#fff;margin-right:4px">{inv_opts}</select><button onclick="saveInvStatus({po_id},this)" style="padding:3px 8px;background:#2563eb;color:#fff;border:none;border-radius:5px;font-size:.75rem;cursor:pointer;font-weight:500">Save</button>{receipt_btn}
           </td>
           <td>{vendor}{f'<div style="font-size:.78rem;color:#6b7280;margin-top:2px">{title}</div>' if not _title_redundant(title_raw, vendor_raw) else ''}{infor_sub}</td>
           <td><span style="display:inline-block;padding:3px 10px;border-radius:12px;font-size:.78rem;font-weight:600;background:{bg};color:{color}">{label}</span></td>
@@ -840,8 +1111,8 @@ function saveInvStatus(poId, btn) {{
   var sel     = document.getElementById('inv-' + poId);
   var newVal  = sel.value;
   var origTxt = btn.textContent;
-  btn.textContent  = 'Saving\u2026';
-  btn.disabled     = true;
+  btn.textContent      = 'Saving\u2026';
+  btn.disabled         = true;
   btn.style.background = '#6b7280';
   fetch('/po/update-status', {{
     method:  'POST',
@@ -854,7 +1125,33 @@ function saveInvStatus(poId, btn) {{
       btn.textContent      = '\u2713 Saved';
       btn.style.background = '#16a34a';
       sel.closest('tr').dataset.invoiceStatus = newVal;
-      setTimeout(function() {{ applyFilters(); }}, 400);
+
+      if (newVal === 'Paid') {{
+        // Add / update the Receipt download link next to the Save button
+        var td = sel.closest('td');
+        var existing = td.querySelector('.receipt-link');
+        if (!existing) {{
+          var a = document.createElement('a');
+          a.className   = 'receipt-link';
+          a.style.cssText = 'display:inline-block;padding:3px 8px;background:#16a34a;'
+            + 'color:#fff;border-radius:5px;font-size:.75rem;font-weight:500;'
+            + 'text-decoration:none;margin-left:4px';
+          a.title     = 'Download PDF receipt';
+          a.innerHTML = '\uD83D\uDCC4\u00A0Receipt';
+          td.appendChild(a);
+          existing = a;
+        }}
+        existing.href = '/po/receipt/' + poId;
+        // Auto-trigger download (browser stays on page because Content-Disposition: attachment)
+        setTimeout(function() {{ window.location.href = '/po/receipt/' + poId; }}, 350);
+        // Hide row after a brief delay (filter will remove it from "unpaid-pending" view)
+        setTimeout(function() {{ applyFilters(); }}, 900);
+      }} else {{
+        // Remove receipt link if status moved away from Paid
+        var existing = sel.closest('td').querySelector('.receipt-link');
+        if (existing) {{ existing.remove(); }}
+        setTimeout(function() {{ applyFilters(); }}, 400);
+      }}
     }} else {{
       btn.textContent      = 'Error';
       btn.style.background = '#dc2626';

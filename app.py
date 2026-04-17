@@ -442,6 +442,12 @@ def po_update_status():
         po_key = str(po_id)
         if po_key in cached.get("pos", {}):
             cached["pos"][po_key]["invoice_status"] = invoice_status
+            # Record paid_at timestamp when AP marks as Paid
+            if invoice_status == "Paid":
+                cached["pos"][po_key]["paid_at"] = datetime.now(timezone.utc).isoformat()
+            elif "paid_at" in cached["pos"][po_key]:
+                # Remove paid_at if status is rolled back from Paid
+                del cached["pos"][po_key]["paid_at"]
             po.CACHE_FILE.write_text(json.dumps(cached, default=str), encoding="utf-8")
     except Exception:
         # Cache update failed — delete it so next load re-fetches cleanly
@@ -451,6 +457,50 @@ def po_update_status():
             pass
 
     return jsonify({"ok": True})
+
+
+@app.route("/po/receipt/<int:po_id>")
+def po_receipt(po_id):
+    """
+    Generate and stream a PDF payment receipt for a single PO.
+    Built on-demand from the PO cache — no file storage required.
+    """
+    # Read PO from cache
+    po_dict = None
+    try:
+        cached  = json.loads(po.CACHE_FILE.read_text(encoding="utf-8"))
+        po_dict = cached.get("pos", {}).get(str(po_id))
+    except Exception:
+        pass
+
+    if not po_dict:
+        return _error_page(
+            f"PO {po_id} was not found in the cache. "
+            "Please refresh the dashboard and try again.",
+            status=404,
+        )
+
+    try:
+        pdf_bytes = po.build_receipt_pdf(po_dict)
+    except RuntimeError as e:
+        # fpdf2 not installed
+        return _error_page(str(e), status=500)
+    except Exception as e:
+        return _error_page(f"Failed to generate receipt PDF: {e}", status=500)
+
+    # Build a clean filename from the PO number
+    pnum     = po.po_number(po_dict).replace("/", "-").replace("\\", "-")
+    filename = f"receipt_{pnum}.pdf"
+
+    return Response(
+        pdf_bytes,
+        status=200,
+        content_type="application/pdf",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Cache-Control": "no-store",
+        },
+    )
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────────
