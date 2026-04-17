@@ -11,6 +11,8 @@ Outputs:
 
 import os
 import sys
+import csv
+import io
 import json
 import time
 import argparse
@@ -133,6 +135,90 @@ def _sort_pos(pos):
         return (status_order, -ts)
     pos.sort(key=_key)
     return pos
+
+
+# ── CSV fetch (primary web path) ─────────────────────────────────────────────────
+
+def _parse_csv_date(s):
+    """Convert a CSV date string ('2025-10-20 13:00:12') to ISO-like format."""
+    if not s or not s.strip():
+        return None
+    s = s.strip()
+    return s.replace(" ", "T") if "T" not in s else s
+
+
+def fetch_pos_from_csv(api_key):
+    """
+    Fetch ALL PO data in a single CSV export call.
+
+    Returns a filtered list of PO dicts (COMPLETED + PARTIALLY_FULFILLED).
+    One API call replaces the entire list-scan + N detail-fetch pattern.
+    Vendor names, line-item totals, and custom fields (Invoice Status) are
+    all present in the CSV.
+
+    Caching: serves from po_cache.json if < 60 min old (zero API calls).
+    """
+    # Serve from cache if fresh
+    cache = load_cache()
+    age   = cache_age_minutes()
+    if cache and age is not None and age < 60:
+        print(f"  CSV cache is {age:.0f}min old — serving without API call.")
+        return _sort_pos(list(cache.values()))
+
+    print("  Fetching PO data from CSV export endpoint...")
+    session = requests.Session()
+    session.headers.update({"Authorization": f"Bearer {api_key}"})
+
+    try:
+        resp = _rl_get(session, f"{BASE_URL}/purchaseorders/purchaseOrders.csv")
+    except RateLimitError:
+        if cache:
+            print("  Rate limited — serving cached data.")
+            return _sort_pos(list(cache.values()))
+        raise
+
+    # Parse CSV — multiple rows per PO (one per line item)
+    reader = csv.DictReader(io.StringIO(resp.text))
+    groups: dict[str, list] = {}
+    for row in reader:
+        po_id = (row.get("Purchase Order ID") or "").strip()
+        if po_id:
+            groups.setdefault(po_id, []).append(row)
+
+    pos_by_id: dict[str, dict] = {}
+    for po_id, rows in groups.items():
+        first  = rows[0]
+        status = (first.get("Status") or "").upper().strip()
+        if status not in ALL_FETCH:
+            continue
+
+        # Total Ordered Cost repeats on every row — it's the PO-level total
+        try:
+            total = float((first.get("Total Ordered Cost") or "0").replace(",", ""))
+        except (ValueError, TypeError):
+            total = None
+
+        invoice_status = (first.get("Invoice Status") or "").strip() or None
+
+        pos_by_id[po_id] = {
+            "id":            int(po_id),
+            "overrideNumber": (first.get("Purchase Order #") or "").strip(),
+            "title":         (first.get("Purchase Order Title") or "").strip(),
+            "vendorName":    (first.get("Vendor") or "").strip() or "Unknown Vendor",
+            "status":        status,
+            "note":          (first.get("Notes") or "").strip(),
+            "approvalDate":  _parse_csv_date(first.get("Approved On")),
+            "updatedAt":     _parse_csv_date(
+                                 first.get("Completed On") or first.get("Approved On")
+                             ),
+            "dueDate":       _parse_csv_date(first.get("Due Date")),
+            "invoice_status": invoice_status,
+            "_total":        total,   # pre-computed; picked up by calc_po_total()
+        }
+
+    save_cache(pos_by_id)
+    print(f"  CSV parsed — {len(pos_by_id)} completed/partial PO(s).")
+    return _sort_pos(list(pos_by_id.values()))
 
 
 # ── Cache helpers ────────────────────────────────────────────────────────────────
@@ -357,16 +443,23 @@ def fetch_completed_pos(api_key, force_refresh=False, fetch_vendors=True,
 # ── Helpers ───────────────────────────────────────────────────────────────────────
 def calc_po_total(po):
     """
-    Calculate PO total from the items array.
-    MaintainX API stores costs as integer cents in `price` / `unitCost`
-    and as decimal dollar strings in `priceDecimal` / `unitCostDecimal`.
-    `price` = line total (unitCost x quantityOrdered), so we use
-    `priceDecimal` directly for each item line.
-    Returns a float (dollars) or None if no cost data is present.
-    """
-    total = 0.0
-    has_data = False
+    Return the PO total as a float (dollars), or None if unknown.
 
+    CSV-fetched POs carry a pre-computed ``_total`` field (Total Ordered Cost
+    from the export).  Legacy detail-fetched POs fall back to calculating
+    from the ``items`` array.
+    """
+    # CSV path — pre-computed total
+    if "_total" in po:
+        t = po.get("_total")
+        try:
+            return round(float(t), 2) if t else None
+        except (ValueError, TypeError):
+            return None
+
+    # Legacy path — calculate from items array
+    total    = 0.0
+    has_data = False
     for item in (po.get("items") or []):
         line_str = item.get("priceDecimal")
         if line_str is not None:
@@ -436,6 +529,7 @@ def _title_redundant(title, vendor):
 def build_po_html(pos, generated_at):
     n_ready   = sum(1 for p in pos if (p.get("status") or "").upper() == "COMPLETED")
     n_partial = sum(1 for p in pos if (p.get("status") or "").upper() == "PARTIALLY_FULFILLED")
+    n_needs   = sum(1 for p in pos if (p.get("invoice_status") or "").strip() != "Paid")
     totals    = [calc_po_total(p) for p in pos]
     known     = [t for t in totals if t is not None]
     total_val = fmt_currency(sum(known)) if known else "—"
@@ -457,10 +551,27 @@ def build_po_html(pos, generated_at):
         approved   = fmt_date(po.get("approvalDate") or po.get("updatedAt"))
         due        = fmt_date(po.get("dueDate"))
         amt        = fmt_currency(total)
+        po_id      = po.get("id", 0)
+
+        # ── Invoice Status cell ──────────────────────────────────────────────────
+        inv_raw = (po.get("invoice_status") or "").strip()
+        if inv_raw == "Paid":
+            inv_opts = ('<option value="Paid" selected>Paid</option>'
+                        '<option value="Unpaid">Unpaid</option>')
+        elif inv_raw == "Unpaid":
+            inv_opts = ('<option value="Unpaid" selected>Unpaid</option>'
+                        '<option value="Paid">Paid</option>')
+        else:
+            inv_raw  = ""   # normalise NULL / unknown
+            inv_opts = ('<option value="" selected>&#8212; Not Set</option>'
+                        '<option value="Unpaid">Unpaid</option>')
 
         rows_html += f"""
-        <tr class="po-row" data-status="{status}" data-vendor="{vendor}">
+        <tr class="po-row" data-status="{status}" data-vendor="{vendor}" data-invoice-status="{inv_raw}">
           <td style="font-weight:600;color:#1e40af;white-space:nowrap">{pnum}</td>
+          <td style="white-space:nowrap">
+            <select id="inv-{po_id}" style="border:1px solid #d1d5db;border-radius:5px;padding:3px 7px;font-size:.78rem;color:#374151;background:#fff;margin-right:4px">{inv_opts}</select><button onclick="saveInvStatus({po_id},this)" style="padding:3px 8px;background:#2563eb;color:#fff;border:none;border-radius:5px;font-size:.75rem;cursor:pointer;font-weight:500">Save</button>
+          </td>
           <td>{vendor}{f'<div style="font-size:.78rem;color:#6b7280;margin-top:2px">{title}</div>' if not _title_redundant(title_raw, vendor_raw) else ''}</td>
           <td><span style="display:inline-block;padding:3px 10px;border-radius:12px;font-size:.78rem;font-weight:600;background:{bg};color:{color}">{label}</span></td>
           <td style="text-align:right;font-weight:600;font-variant-numeric:tabular-nums">{amt}</td>
@@ -480,15 +591,16 @@ def build_po_html(pos, generated_at):
 <style>
   *{{box-sizing:border-box;margin:0;padding:0}}
   body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#f1f5f9;color:#1e293b;min-height:100vh}}
-  .header{{background:#fff;border-bottom:1px solid #e2e8f0;padding:18px 28px;display:flex;align-items:center;justify-content:space-between}}
+  .header{{background:#fff;border-bottom:1px solid #e2e8f0;padding:18px 28px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px}}
   .header h1{{font-size:1.25rem;font-weight:700;color:#0f2d52}}
   .header .sub{{font-size:.8rem;color:#94a3b8;margin-top:2px}}
   .kpi-strip{{display:flex;gap:14px;padding:18px 28px;flex-wrap:wrap}}
-  .kpi{{background:#fff;border:1px solid #e2e8f0;border-radius:10px;padding:14px 20px;min-width:160px;flex:1}}
+  .kpi{{background:#fff;border:1px solid #e2e8f0;border-radius:10px;padding:14px 20px;min-width:140px;flex:1}}
   .kpi .val{{font-size:1.8rem;font-weight:700;color:#0f2d52;line-height:1}}
   .kpi .lbl{{font-size:.75rem;color:#94a3b8;margin-top:4px;text-transform:uppercase;letter-spacing:.05em}}
   .kpi.green .val{{color:#16a34a}}
   .kpi.amber .val{{color:#d97706}}
+  .kpi.red   .val{{color:#dc2626}}
   .content{{padding:0 28px 28px}}
   .card{{background:#fff;border:1px solid #e2e8f0;border-radius:10px;overflow:hidden}}
   .card-header{{padding:14px 18px;background:#f8fafc;border-bottom:1px solid #e2e8f0;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px}}
@@ -498,7 +610,7 @@ def build_po_html(pos, generated_at):
   .filters input:focus,.filters select:focus{{border-color:#2563eb;box-shadow:0 0 0 2px rgba(37,99,235,.15)}}
   table{{width:100%;border-collapse:collapse;font-size:.85rem}}
   th{{background:#f8fafc;padding:10px 14px;text-align:left;font-size:.75rem;font-weight:600;color:#6b7280;text-transform:uppercase;letter-spacing:.05em;border-bottom:1px solid #e2e8f0;white-space:nowrap}}
-  td{{padding:11px 14px;border-bottom:1px solid #f1f5f9;vertical-align:top}}
+  td{{padding:11px 14px;border-bottom:1px solid #f1f5f9;vertical-align:middle}}
   tr:last-child td{{border-bottom:none}}
   tr:hover td{{background:#fafbff}}
   .empty{{text-align:center;padding:40px;color:#9ca3af;font-size:.9rem}}
@@ -514,10 +626,14 @@ def build_po_html(pos, generated_at):
       <div class="sub">Generated {generated_at}</div>
     </div>
   </div>
-  <a href="/po/refresh" title="Fetch full PO details (vendor names &amp; totals)" style="font-size:.8rem;color:#2563eb;text-decoration:none;padding:5px 12px;border:1px solid #bfdbfe;border-radius:6px;white-space:nowrap;background:#eff6ff;">&#8635; Refresh Data</a>
+  <a href="/po/refresh" title="Pull latest data from MaintainX" style="font-size:.8rem;color:#2563eb;text-decoration:none;padding:5px 12px;border:1px solid #bfdbfe;border-radius:6px;white-space:nowrap;background:#eff6ff;">&#8635; Refresh Data</a>
 </div>
 
 <div class="kpi-strip">
+  <div class="kpi red">
+    <div class="val">{n_needs}</div>
+    <div class="lbl">Needs Payment</div>
+  </div>
   <div class="kpi green">
     <div class="val">{n_ready}</div>
     <div class="lbl">Ready to Pay</div>
@@ -542,6 +658,13 @@ def build_po_html(pos, generated_at):
       <h2>Purchase Orders</h2>
       <div class="filters">
         <input type="text" id="search" placeholder="Search PO # or vendor..." oninput="applyFilters()">
+        <select id="invoiceFilter" onchange="applyFilters()">
+          <option value="unpaid-pending">Unpaid &amp; Pending</option>
+          <option value="all">All (incl. Paid)</option>
+          <option value="unpaid">Unpaid Only</option>
+          <option value="pending">Pending Only</option>
+          <option value="paid">Paid Only</option>
+        </select>
         <select id="statusFilter" onchange="applyFilters()">
           <option value="">All Statuses</option>
           <option value="COMPLETED">Ready to Pay</option>
@@ -559,6 +682,7 @@ def build_po_html(pos, generated_at):
         <thead>
           <tr>
             <th>PO #</th>
+            <th>Invoice Status</th>
             <th>Vendor</th>
             <th>Status</th>
             <th style="text-align:right">Total</th>
@@ -568,7 +692,7 @@ def build_po_html(pos, generated_at):
           </tr>
         </thead>
         <tbody id="poBody">
-          {rows_html if rows_html else '<tr><td colspan="7" class="empty">No completed purchase orders found.</td></tr>'}
+          {rows_html if rows_html else '<tr><td colspan="8" class="empty">No completed purchase orders found.</td></tr>'}
         </tbody>
       </table>
     </div>
@@ -576,17 +700,64 @@ def build_po_html(pos, generated_at):
 </div>
 
 <script>
+function saveInvStatus(poId, btn) {{
+  var sel     = document.getElementById('inv-' + poId);
+  var newVal  = sel.value;
+  var origTxt = btn.textContent;
+  btn.textContent  = 'Saving\u2026';
+  btn.disabled     = true;
+  btn.style.background = '#6b7280';
+  fetch('/po/update-status', {{
+    method:  'POST',
+    headers: {{'Content-Type': 'application/json'}},
+    body:    JSON.stringify({{po_id: poId, invoice_status: newVal || null}})
+  }})
+  .then(function(r) {{ return r.json(); }})
+  .then(function(data) {{
+    if (data.ok) {{
+      btn.textContent      = '\u2713 Saved';
+      btn.style.background = '#16a34a';
+      sel.closest('tr').dataset.invoiceStatus = newVal;
+      setTimeout(function() {{ applyFilters(); }}, 400);
+    }} else {{
+      btn.textContent      = 'Error';
+      btn.style.background = '#dc2626';
+    }}
+    setTimeout(function() {{
+      btn.textContent      = origTxt;
+      btn.style.background = '#2563eb';
+      btn.disabled         = false;
+    }}, 2000);
+  }})
+  .catch(function() {{
+    btn.textContent      = 'Error';
+    btn.style.background = '#dc2626';
+    setTimeout(function() {{
+      btn.textContent      = origTxt;
+      btn.style.background = '#2563eb';
+      btn.disabled         = false;
+    }}, 2000);
+  }});
+}}
+
 function applyFilters() {{
   var search  = document.getElementById('search').value.toLowerCase();
   var status  = document.getElementById('statusFilter').value;
   var vendor  = document.getElementById('vendorFilter').value;
+  var invFilt = document.getElementById('invoiceFilter').value;
   var rows    = document.querySelectorAll('#poBody .po-row');
   var visible = 0;
   rows.forEach(function(row) {{
-    var matchSearch = !search || row.textContent.toLowerCase().includes(search);
-    var matchStatus = !status || row.dataset.status === status;
-    var matchVendor = !vendor || row.dataset.vendor === vendor;
-    var show = matchSearch && matchStatus && matchVendor;
+    var inv          = row.dataset.invoiceStatus;
+    var matchSearch  = !search || row.textContent.toLowerCase().includes(search);
+    var matchStatus  = !status || row.dataset.status === status;
+    var matchVendor  = !vendor || row.dataset.vendor === vendor;
+    var matchInvoice = true;
+    if      (invFilt === 'unpaid-pending') {{ matchInvoice = inv !== 'Paid'; }}
+    else if (invFilt === 'unpaid')         {{ matchInvoice = inv === 'Unpaid'; }}
+    else if (invFilt === 'pending')        {{ matchInvoice = inv === ''; }}
+    else if (invFilt === 'paid')           {{ matchInvoice = inv === 'Paid'; }}
+    var show = matchSearch && matchStatus && matchVendor && matchInvoice;
     row.style.display = show ? '' : 'none';
     if (show) visible++;
   }});

@@ -19,7 +19,8 @@ import json
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
-from flask import Flask, Response, render_template
+import requests as _http
+from flask import Flask, Response, render_template, request, jsonify
 
 # ── Vercel detection ──────────────────────────────────────────────────────────────
 IS_VERCEL = os.environ.get("VERCEL") == "1"
@@ -233,14 +234,10 @@ def po_dashboard():
     if html:
         return Response(html, content_type="text/html")
 
-    # Layers 2+3 handled inside fetch_completed_pos (file cache + API).
-    # fetch_details=False: list-scan only (~1–3 API calls), no per-PO detail fetches.
-    # Cached detail data (vendor names, item totals) is reused when available.
-    # Use /po/refresh to trigger a full detail rebuild.
+    # Single CSV call returns all PO data including vendor names, totals,
+    # and custom fields (Invoice Status).  Cache TTL = 60 min.
     try:
-        pos = po.fetch_completed_pos(
-            api_key, force_refresh=False, fetch_vendors=False, fetch_details=False
-        )
+        pos = po.fetch_pos_from_csv(api_key)
         generated_at = datetime.now().strftime("%A, %B %d %Y at %I:%M %p")
         html = po.build_po_html(pos, generated_at)
         _mem_set("po", html)
@@ -256,34 +253,33 @@ def po_dashboard():
 @app.route("/po/refresh")
 def po_refresh():
     """
-    Trigger a full PO detail refresh: fetches every PO individually to populate
-    vendor names and line-item totals.  Only use this once rate-limit budget is
-    available (i.e. not immediately after loading the WO dashboard).
-    Results are saved to /tmp/po_cache.json for subsequent /po requests.
+    Force a fresh CSV pull from MaintainX, bypassing the 60-min cache.
+    Useful after new POs are approved or Invoice Status values change in MaintainX.
     """
     api_key = _get_api_key()
     if not api_key:
         return _error_page("MAINTAINX_API_KEY is not configured.", status=500)
 
+    # Delete cache file so fetch_pos_from_csv() skips the freshness check
     try:
-        pos = po.fetch_completed_pos(
-            api_key, force_refresh=False, fetch_vendors=False, fetch_details=True
-        )
+        if po.CACHE_FILE.exists():
+            po.CACHE_FILE.unlink()
+    except Exception:
+        pass
+    _mem_cache.pop("po", None)
+
+    try:
+        pos = po.fetch_pos_from_csv(api_key)
         generated_at = datetime.now().strftime("%A, %B %d %Y at %I:%M %p")
         html = po.build_po_html(pos, generated_at)
-        # Bust caches so next /po request picks up the fresh data
-        _mem_cache.pop("po", None)
         _mem_set("po", html)
-        # Return the full dashboard with a banner indicating it was just refreshed
         banner = (
             '<div style="background:#dcfce7;border:1px solid #16a34a;border-radius:8px;'
             'padding:10px 18px;margin:12px 28px;font-size:.85rem;color:#166534;">'
-            '&#10003; Full refresh complete — vendor names and totals are now up to date.'
+            '&#10003; Refresh complete &mdash; data is up to date.'
             '</div>'
         )
-        # Insert banner after <body>
-        html_with_banner = html.replace("<body>", "<body>" + banner, 1)
-        return Response(html_with_banner, content_type="text/html")
+        return Response(html.replace("<body>", "<body>" + banner, 1), content_type="text/html")
     except po.RateLimitError as e:
         return _rate_limit_refresh_page(e.reset_seconds)
     except Exception as e:
@@ -334,6 +330,59 @@ def _rate_limit_refresh_page(wait_seconds=65):
 </body>
 </html>"""
     return Response(html, status=200, content_type="text/html")
+
+
+@app.route("/po/update-status", methods=["POST"])
+def po_update_status():
+    """
+    Update the Invoice Status custom field on a single PO.
+    Body: { "po_id": 123456, "invoice_status": "Paid" | "Unpaid" | null }
+    Returns: { "ok": true } or { "ok": false, "error": "..." }
+    """
+    api_key = _get_api_key()
+    if not api_key:
+        return jsonify({"ok": False, "error": "No API key configured"}), 500
+
+    body          = request.get_json(silent=True) or {}
+    po_id         = body.get("po_id")
+    invoice_status = body.get("invoice_status")   # "Paid", "Unpaid", or None
+
+    if not po_id:
+        return jsonify({"ok": False, "error": "Missing po_id"}), 400
+
+    try:
+        resp = _http.patch(
+            f"https://api.getmaintainx.com/v1/purchaseorders/{po_id}",
+            headers={
+                "Authorization":  f"Bearer {api_key}",
+                "Content-Type":   "application/json",
+            },
+            json={"extraFields": {"Invoice Status": invoice_status}},
+            timeout=15,
+        )
+        resp.raise_for_status()
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+    # Bust in-memory cache so next /po load regenerates HTML
+    _mem_cache.pop("po", None)
+
+    # Update the cache file in-place so the next /po request doesn't need
+    # to re-fetch the CSV just because one status changed
+    try:
+        cached = json.loads(po.CACHE_FILE.read_text(encoding="utf-8"))
+        po_key = str(po_id)
+        if po_key in cached.get("pos", {}):
+            cached["pos"][po_key]["invoice_status"] = invoice_status
+            po.CACHE_FILE.write_text(json.dumps(cached, default=str), encoding="utf-8")
+    except Exception:
+        # Cache update failed — delete it so next load re-fetches cleanly
+        try:
+            po.CACHE_FILE.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    return jsonify({"ok": True})
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────────
