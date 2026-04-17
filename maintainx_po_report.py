@@ -220,11 +220,11 @@ def fetch_pos_from_csv(api_key):
 
         pos_by_id[po_id] = {
             "id":            int(po_id),
-            "overrideNumber": (first.get("Purchase Order #") or "").strip(),
-            "title":         (first.get("Purchase Order Title") or "").strip(),
-            "vendorName":    (first.get("Vendor") or "").strip() or "Unknown Vendor",
+            "overrideNumber": _sanitize((first.get("Purchase Order #") or "").strip()),
+            "title":         _sanitize((first.get("Purchase Order Title") or "").strip()),
+            "vendorName":    _sanitize((first.get("Vendor") or "").strip()) or "Unknown Vendor",
             "status":        status,
-            "note":          (first.get("Notes") or "").strip(),
+            "note":          _sanitize((first.get("Notes") or "").strip()),
             "approvalDate":  _parse_csv_date(first.get("Approved On")),
             "updatedAt":     _parse_csv_date(
                                  first.get("Completed On") or first.get("Approved On")
@@ -232,7 +232,7 @@ def fetch_pos_from_csv(api_key):
             "dueDate":       _parse_csv_date(first.get("Due Date")),
             "invoice_status": invoice_status,
             "_total":        total,   # pre-computed; picked up by calc_po_total()
-            "approver_name": approver_name,
+            "approver_name": _sanitize(approver_name),
             "line_items":    _extract_line_items(rows),
         }
 
@@ -288,13 +288,32 @@ def cache_age_minutes():
         return None
 
 
+def _deep_sanitize(obj):
+    """
+    Recursively walk a JSON-serializable structure and sanitize all string values,
+    replacing any lone surrogates that would cause json.dumps() to fail.
+    """
+    if isinstance(obj, dict):
+        return {k: _deep_sanitize(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_deep_sanitize(v) for v in obj]
+    if isinstance(obj, str):
+        return _sanitize(obj)
+    return obj
+
+
 def save_cache(pos_by_id):
     """Persist {str(po_id): po_dict} to disk."""
     payload = {
         "saved_at": datetime.now(timezone.utc).isoformat(),
         "pos": pos_by_id,
     }
-    CACHE_FILE.write_text(json.dumps(payload, default=str), encoding="utf-8")
+    try:
+        text = json.dumps(payload, default=str)
+    except (UnicodeEncodeError, ValueError):
+        # Surrogate characters slipped through — sanitize the whole payload and retry
+        text = json.dumps(_deep_sanitize(payload), default=str)
+    CACHE_FILE.write_text(text, encoding="utf-8")
 
 
 # ── Vendor cache helpers ─────────────────────────────────────────────────────────
@@ -331,7 +350,11 @@ def save_vendor_cache(vendors_by_name):
         "saved_at": datetime.now(timezone.utc).isoformat(),
         "vendors":  vendors_by_name,
     }
-    VENDOR_CACHE_FILE.write_text(json.dumps(payload, default=str), encoding="utf-8")
+    try:
+        text = json.dumps(payload, default=str)
+    except (UnicodeEncodeError, ValueError):
+        text = json.dumps(_deep_sanitize(payload), default=str)
+    VENDOR_CACHE_FILE.write_text(text, encoding="utf-8")
 
 
 def fetch_vendor_data(api_key):
@@ -633,12 +656,24 @@ def po_number(po):
     return f"ID {po.get('id', '?')}"
 
 
+def _sanitize(s):
+    """
+    Strip lone surrogate code points (U+D800–U+DFFF) that are sometimes
+    present in MaintainX CSV exports when a field contains unusual characters.
+    Lone surrogates cannot be encoded as UTF-8 and cause json.dumps() to raise
+    UnicodeEncodeError in Python 3.12's C JSON accelerator.
+    """
+    if not s:
+        return s
+    return s.encode("utf-8", errors="replace").decode("utf-8")
+
+
 def _get_csv_field(row, *keys):
-    """Try multiple column name variants, return first non-empty value."""
+    """Try multiple column name variants, return first non-empty sanitized value."""
     for k in keys:
         v = (row.get(k) or "").strip()
         if v:
-            return v
+            return _sanitize(v)
     return ""
 
 
