@@ -27,7 +27,9 @@ PAGE_SIZE    = 100
 KEY_FILE     = SCRIPT_DIR / "MaintainX_API_key.txt"
 OUTPUT_FILE  = SCRIPT_DIR / "po_dashboard.html"
 EMAIL_OUTPUT = SCRIPT_DIR / "po_dashboard_email.html"
-CACHE_FILE   = SCRIPT_DIR / "po_cache.json"
+CACHE_FILE        = SCRIPT_DIR / "po_cache.json"
+VENDOR_CACHE_FILE = SCRIPT_DIR / "vendor_cache.json"
+VENDOR_CACHE_TTL  = 120   # minutes — vendors change infrequently
 
 # Statuses to include — COMPLETED = all items received = ready to pay
 #                       PARTIALLY_FULFILLED = some items received = partially ready
@@ -220,6 +222,26 @@ def fetch_pos_from_csv(api_key):
             "_total":        total,   # pre-computed; picked up by calc_po_total()
         }
 
+    # ── Enrich POs with vendor ID and Infor Vendor # ──────────────────────────────
+    # Vendor names in the PO CSV are matched case-insensitively against the
+    # vendor REST API response to look up the vendor ID (needed for PATCH calls)
+    # and the Infor Vendor # custom field.
+    try:
+        vendor_data = fetch_vendor_data(api_key)
+    except RateLimitError:
+        vendor_data = load_vendor_cache()   # fall back to stale cache
+        print("  Rate limited on vendor fetch — using stale vendor cache.")
+
+    for po_dict in pos_by_id.values():
+        vname = po_dict.get("vendorName", "")
+        vinfo = vendor_data.get(vname.lower())
+        if vinfo:
+            po_dict["vendor_id"]           = vinfo["id"]
+            po_dict["infor_vendor_number"] = vinfo["infor_vendor_number"]
+        else:
+            po_dict["vendor_id"]           = None
+            po_dict["infor_vendor_number"] = None
+
     save_cache(pos_by_id)
     print(f"  CSV parsed — {len(pos_by_id)} completed/partial PO(s).")
     return _sort_pos(list(pos_by_id.values()))
@@ -259,6 +281,98 @@ def save_cache(pos_by_id):
         "pos": pos_by_id,
     }
     CACHE_FILE.write_text(json.dumps(payload, default=str), encoding="utf-8")
+
+
+# ── Vendor cache helpers ─────────────────────────────────────────────────────────
+
+def load_vendor_cache():
+    """Return {vendor_name_lower: {id, name, infor_vendor_number}} or {}."""
+    if not VENDOR_CACHE_FILE.exists():
+        return {}
+    try:
+        data = json.loads(VENDOR_CACHE_FILE.read_text(encoding="utf-8"))
+        return data.get("vendors", {})
+    except Exception:
+        return {}
+
+
+def vendor_cache_age_minutes():
+    """Return age of vendor cache in minutes, or None if missing/unreadable."""
+    if not VENDOR_CACHE_FILE.exists():
+        return None
+    try:
+        data = json.loads(VENDOR_CACHE_FILE.read_text(encoding="utf-8"))
+        saved_at = data.get("saved_at")
+        if not saved_at:
+            return None
+        age = datetime.now(timezone.utc) - datetime.fromisoformat(saved_at)
+        return age.total_seconds() / 60
+    except Exception:
+        return None
+
+
+def save_vendor_cache(vendors_by_name):
+    """Persist {name_lower: vendor_dict} to disk."""
+    payload = {
+        "saved_at": datetime.now(timezone.utc).isoformat(),
+        "vendors":  vendors_by_name,
+    }
+    VENDOR_CACHE_FILE.write_text(json.dumps(payload, default=str), encoding="utf-8")
+
+
+def fetch_vendor_data(api_key):
+    """
+    Fetch all vendors with their 'Infor Vendor #' custom field via REST API.
+
+    Returns {vendor_name_lower: {"id": int, "name": str, "infor_vendor_number": str|None}}.
+    Results are cached in VENDOR_CACHE_FILE for VENDOR_CACHE_TTL minutes.
+    Called once per cold-start (adds 1–2 API calls alongside the PO CSV call).
+    """
+    cached = load_vendor_cache()
+    age    = vendor_cache_age_minutes()
+    if cached and age is not None and age < VENDOR_CACHE_TTL:
+        print(f"  Vendor cache is {age:.0f}min old — using without API call.")
+        return cached
+
+    print("  Fetching vendor list (for Infor Vendor # data)...")
+    session = requests.Session()
+    session.headers.update({"Authorization": f"Bearer {api_key}"})
+
+    vendors_by_name = {}
+    cursor = None
+    while True:
+        params = {"limit": PAGE_SIZE}
+        if cursor:
+            params["cursor"] = cursor
+        try:
+            resp = _rl_get(session, f"{BASE_URL}/vendors", params=params)
+        except RateLimitError:
+            if cached:
+                print("  Rate limited on vendor fetch — using cached data.")
+                return cached
+            raise
+
+        body        = resp.json()
+        vendor_list = next((v for v in body.values() if isinstance(v, list)), [])
+        for v in vendor_list:
+            vid  = v.get("id")
+            name = (v.get("name") or "").strip()
+            if vid is not None and name:
+                extra     = v.get("extraFields") or {}
+                infor_num = (extra.get("Infor Vendor #") or "").strip() or None
+                vendors_by_name[name.lower()] = {
+                    "id":                 int(vid),
+                    "name":               name,
+                    "infor_vendor_number": infor_num,
+                }
+        cursor = body.get("nextCursor")
+        if not cursor or len(vendor_list) < PAGE_SIZE:
+            break
+        time.sleep(0.5)
+
+    save_vendor_cache(vendors_by_name)
+    print(f"  Vendor data fetched — {len(vendors_by_name)} vendor(s).")
+    return vendors_by_name
 
 
 # ── Fetch POs ────────────────────────────────────────────────────────────────────
@@ -557,6 +671,29 @@ def build_po_html(pos, generated_at):
         amt        = fmt_currency(total)
         po_id      = po.get("id", 0)
 
+        # ── Infor Vendor # sub-row (lives inside the Vendor cell) ───────────────
+        vendor_id      = po.get("vendor_id")
+        infor_num_raw  = (po.get("infor_vendor_number") or "").strip()
+        infor_esc      = _esc(infor_num_raw)
+        vid_js         = str(vendor_id) if vendor_id else "null"
+        if vendor_id:
+            save_extra = ""
+        else:
+            save_extra = ' disabled title="Vendor ID not found — use Refresh Data"'
+
+        infor_sub = (
+            f'<div style="display:flex;align-items:center;gap:4px;margin-top:5px">'
+            f'<span style="font-size:.72rem;color:#94a3b8;white-space:nowrap">Infor&nbsp;#</span>'
+            f'<input type="text" id="inf-{po_id}" value="{infor_esc}" placeholder="Not set"'
+            f' style="border:1px solid #d1d5db;border-radius:4px;padding:2px 6px;'
+            f'font-size:.75rem;width:80px;color:#374151;background:#fff">'
+            f'<button onclick="saveInforNum({po_id},{vid_js},this)"{save_extra}'
+            f' style="padding:2px 7px;background:#2563eb;color:#fff;border:none;'
+            f'border-radius:4px;font-size:.72rem;cursor:pointer;font-weight:500'
+            f'{";opacity:.4;cursor:not-allowed" if not vendor_id else ""}">Save</button>'
+            f'</div>'
+        )
+
         # ── Invoice Status cell ──────────────────────────────────────────────────
         inv_raw = (po.get("invoice_status") or "").strip()
         if inv_raw == "Paid":
@@ -576,7 +713,7 @@ def build_po_html(pos, generated_at):
           <td style="white-space:nowrap">
             <select id="inv-{po_id}" style="border:1px solid #d1d5db;border-radius:5px;padding:3px 7px;font-size:.78rem;color:#374151;background:#fff;margin-right:4px">{inv_opts}</select><button onclick="saveInvStatus({po_id},this)" style="padding:3px 8px;background:#2563eb;color:#fff;border:none;border-radius:5px;font-size:.75rem;cursor:pointer;font-weight:500">Save</button>
           </td>
-          <td>{vendor}{f'<div style="font-size:.78rem;color:#6b7280;margin-top:2px">{title}</div>' if not _title_redundant(title_raw, vendor_raw) else ''}</td>
+          <td>{vendor}{f'<div style="font-size:.78rem;color:#6b7280;margin-top:2px">{title}</div>' if not _title_redundant(title_raw, vendor_raw) else ''}{infor_sub}</td>
           <td><span style="display:inline-block;padding:3px 10px;border-radius:12px;font-size:.78rem;font-weight:600;background:{bg};color:{color}">{label}</span></td>
           <td style="text-align:right;font-weight:600;font-variant-numeric:tabular-nums">{amt}</td>
           <td style="white-space:nowrap;color:#374151">{approved}</td>
@@ -723,6 +860,45 @@ function saveInvStatus(poId, btn) {{
       btn.style.background = '#16a34a';
       sel.closest('tr').dataset.invoiceStatus = newVal;
       setTimeout(function() {{ applyFilters(); }}, 400);
+    }} else {{
+      btn.textContent      = 'Error';
+      btn.style.background = '#dc2626';
+    }}
+    setTimeout(function() {{
+      btn.textContent      = origTxt;
+      btn.style.background = '#2563eb';
+      btn.disabled         = false;
+    }}, 2000);
+  }})
+  .catch(function() {{
+    btn.textContent      = 'Error';
+    btn.style.background = '#dc2626';
+    setTimeout(function() {{
+      btn.textContent      = origTxt;
+      btn.style.background = '#2563eb';
+      btn.disabled         = false;
+    }}, 2000);
+  }});
+}}
+
+function saveInforNum(poId, vendorId, btn) {{
+  if (!vendorId) {{ alert('No vendor ID found — use Refresh Data to reload vendor info.'); return; }}
+  var inp     = document.getElementById('inf-' + poId);
+  var newVal  = inp.value.trim();
+  var origTxt = btn.textContent;
+  btn.textContent      = 'Saving\u2026';
+  btn.disabled         = true;
+  btn.style.background = '#6b7280';
+  fetch('/vendor/update-infor-number', {{
+    method:  'POST',
+    headers: {{'Content-Type': 'application/json'}},
+    body:    JSON.stringify({{vendor_id: vendorId, infor_vendor_number: newVal || null}})
+  }})
+  .then(function(r) {{ return r.json(); }})
+  .then(function(data) {{
+    if (data.ok) {{
+      btn.textContent      = '\u2713 Saved';
+      btn.style.background = '#16a34a';
     }} else {{
       btn.textContent      = 'Error';
       btn.style.background = '#dc2626';

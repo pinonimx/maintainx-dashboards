@@ -27,7 +27,8 @@ IS_VERCEL = os.environ.get("VERCEL") == "1"
 
 import maintainx_po_report as po
 if IS_VERCEL:
-    po.CACHE_FILE = Path("/tmp/po_cache.json")
+    po.CACHE_FILE        = Path("/tmp/po_cache.json")
+    po.VENDOR_CACHE_FILE = Path("/tmp/vendor_cache.json")
 
 import maintainx_dashboard as mxd
 
@@ -330,6 +331,73 @@ def _rate_limit_refresh_page(wait_seconds=65):
 </body>
 </html>"""
     return Response(html, status=200, content_type="text/html")
+
+
+@app.route("/vendor/update-infor-number", methods=["POST"])
+def vendor_update_infor_number():
+    """
+    Update the 'Infor Vendor #' custom field on a vendor record.
+    Body: { "vendor_id": 1227285, "infor_vendor_number": "V000076" | null }
+    Returns: { "ok": true } or { "ok": false, "error": "..." }
+    """
+    api_key = _get_api_key()
+    if not api_key:
+        return jsonify({"ok": False, "error": "No API key configured"}), 500
+
+    body               = request.get_json(silent=True) or {}
+    vendor_id          = body.get("vendor_id")
+    infor_vendor_number = body.get("infor_vendor_number")   # str or None
+
+    if not vendor_id:
+        return jsonify({"ok": False, "error": "Missing vendor_id"}), 400
+
+    try:
+        resp = _http.patch(
+            f"https://api.getmaintainx.com/v1/vendors/{vendor_id}",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type":  "application/json",
+            },
+            json={"extraFields": {"Infor Vendor #": infor_vendor_number}},
+            timeout=15,
+        )
+        resp.raise_for_status()
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+    # Bust in-memory PO cache so next /po load regenerates HTML with updated value
+    _mem_cache.pop("po", None)
+
+    # Update vendor cache in-place (find by vendor ID)
+    try:
+        vcached = json.loads(po.VENDOR_CACHE_FILE.read_text(encoding="utf-8"))
+        for vinfo in vcached.get("vendors", {}).values():
+            if vinfo.get("id") == vendor_id:
+                vinfo["infor_vendor_number"] = infor_vendor_number
+                break
+        po.VENDOR_CACHE_FILE.write_text(json.dumps(vcached, default=str), encoding="utf-8")
+    except Exception:
+        try:
+            po.VENDOR_CACHE_FILE.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    # Update PO cache in-place for all POs belonging to this vendor
+    try:
+        pcached  = json.loads(po.CACHE_FILE.read_text(encoding="utf-8"))
+        pos_dict = pcached.get("pos", {})
+        for po_dict in pos_dict.values():
+            if po_dict.get("vendor_id") == vendor_id:
+                po_dict["infor_vendor_number"] = infor_vendor_number
+        pcached["pos"] = pos_dict
+        po.CACHE_FILE.write_text(json.dumps(pcached, default=str), encoding="utf-8")
+    except Exception:
+        try:
+            po.CACHE_FILE.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    return jsonify({"ok": True})
 
 
 @app.route("/po/update-status", methods=["POST"])
