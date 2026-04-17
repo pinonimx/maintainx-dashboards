@@ -728,6 +728,45 @@ def _extract_line_items(rows):
     return items
 
 
+_PDF_CHAR_MAP = [
+    # Common Unicode punctuation that Helvetica (Latin-1) can't render
+    ("\u2014", "-"),    # em dash  —
+    ("\u2013", "-"),    # en dash  –
+    ("\u2012", "-"),    # figure dash
+    ("\u2015", "-"),    # horizontal bar
+    ("\u2018", "'"),    # left single quote
+    ("\u2019", "'"),    # right single quote
+    ("\u201A", ","),    # single low-9 quote
+    ("\u201C", '"'),    # left double quote
+    ("\u201D", '"'),    # right double quote
+    ("\u201E", '"'),    # double low-9 quote
+    ("\u2026", "..."),  # ellipsis
+    ("\u00A0", " "),    # non-breaking space
+    ("\u2022", "*"),    # bullet
+    ("\u00AE", "(R)"),  # registered trademark
+    ("\u00A9", "(C)"),  # copyright
+    ("\u2122", "(TM)"), # trademark
+    ("\u00D7", "x"),    # multiplication sign
+    ("\u00F7", "/"),    # division sign
+]
+
+
+def _pdf_safe(text):
+    """
+    Convert text to a string safe for fpdf2's built-in Helvetica font (Latin-1 range).
+    Maps common Unicode punctuation/symbols to ASCII equivalents, then falls back
+    to latin-1 encoding (replacing any remaining unsupported chars with '?').
+    """
+    if text is None:
+        return ""
+    s = str(text)
+    for uni_char, replacement in _PDF_CHAR_MAP:
+        s = s.replace(uni_char, replacement)
+    # Encode to latin-1; this handles accented chars (e, n, etc.) natively
+    # and replaces anything still outside latin-1 with '?'
+    return s.encode("latin-1", errors="replace").decode("latin-1")
+
+
 def _fmt_qty(val):
     """Format a quantity: integer if whole number, else up to 2 decimal places."""
     if val is None:
@@ -776,17 +815,17 @@ def build_receipt_pdf(po_dict):
     pdf.ln(8)
 
     # ── Info grid (2-column) ──────────────────────────────────────────────────────
-    pnum       = po_number(po_dict)
-    vendor     = po_dict.get("vendorName", "Unknown Vendor")
-    infor_num  = po_dict.get("infor_vendor_number") or "—"
-    approver   = po_dict.get("approver_name") or "—"
-    status_lbl = STATUS_LABEL.get((po_dict.get("status") or "").upper(),
-                                   po_dict.get("status", "—"))
-    approved   = fmt_date(po_dict.get("approvalDate") or po_dict.get("updatedAt"))
-    due        = fmt_date(po_dict.get("dueDate"))
+    pnum       = _pdf_safe(po_number(po_dict))
+    vendor     = _pdf_safe(po_dict.get("vendorName", "Unknown Vendor"))
+    infor_num  = _pdf_safe(po_dict.get("infor_vendor_number") or "N/A")
+    approver   = _pdf_safe(po_dict.get("approver_name") or "N/A")
+    status_lbl = _pdf_safe(STATUS_LABEL.get((po_dict.get("status") or "").upper(),
+                                             po_dict.get("status", "N/A")))
+    approved   = _pdf_safe(fmt_date(po_dict.get("approvalDate") or po_dict.get("updatedAt")))
+    due        = _pdf_safe(fmt_date(po_dict.get("dueDate")))
     paid_raw   = po_dict.get("paid_at")
-    paid_date  = (fmt_date(paid_raw) if paid_raw
-                  else datetime.now().strftime("%b %d, %Y"))
+    paid_date  = _pdf_safe(fmt_date(paid_raw) if paid_raw
+                           else datetime.now().strftime("%b %d, %Y"))
 
     lx    = pdf.l_margin
     rx    = lx + pw / 2 + 2
@@ -797,7 +836,7 @@ def build_receipt_pdf(po_dict):
 
     left_items  = [("PO #",           pnum,       None   ),
                    ("Vendor",         vendor,     None   ),
-                   ("Infor Vendor #", infor_num,  None   ),
+                   ("Infor #",        infor_num,  None   ),
                    ("Approver",       approver,   None   )]
     right_items = [("Status",         status_lbl, None   ),
                    ("Approved",       approved,   None   ),
@@ -811,7 +850,7 @@ def build_receipt_pdf(po_dict):
         pdf.cell(LBL_W, LH, label.upper(), border=0)
         pdf.set_font("Helvetica", "", 9)
         pdf.set_text_color(*(color or C_BLACK))
-        pdf.cell(half - LBL_W, LH, str(value or "—"), border=0)
+        pdf.cell(half - LBL_W, LH, _pdf_safe(value or "N/A"), border=0)
 
     for i, (label, value, color) in enumerate(right_items):
         pdf.set_xy(rx, sy + i * LH)
@@ -820,7 +859,7 @@ def build_receipt_pdf(po_dict):
         pdf.cell(22, LH, label.upper(), border=0)
         pdf.set_font("Helvetica", "", 9)
         pdf.set_text_color(*(color or C_BLACK))
-        pdf.cell(half - 22, LH, str(value or "—"), border=0)
+        pdf.cell(half - 22, LH, _pdf_safe(value or "N/A"), border=0)
 
     pdf.set_text_color(*C_BLACK)
     pdf.set_y(sy + len(left_items) * LH + 4)
@@ -861,12 +900,12 @@ def build_receipt_pdf(po_dict):
         pdf.set_text_color(*C_BLACK)
         row_data = [
             str(item.get("line_number", idx + 1)),
-            (item.get("part_name")   or "")[:60],
-            (item.get("part_number") or "")[:18],
-            _fmt_qty(item.get("qty_ordered")),
-            _fmt_qty(item.get("qty_received")),
-            fmt_currency(item.get("unit_cost")),
-            fmt_currency(item.get("line_total")),
+            _pdf_safe((item.get("part_name")   or "")[:60]),
+            _pdf_safe((item.get("part_number") or "")[:18]),
+            _pdf_safe(_fmt_qty(item.get("qty_ordered"))),
+            _pdf_safe(_fmt_qty(item.get("qty_received"))),
+            _pdf_safe(fmt_currency(item.get("unit_cost"))),
+            _pdf_safe(fmt_currency(item.get("line_total"))),
         ]
         for w, d, a in zip(col_w, row_data, aligns):
             pdf.cell(w, TH, d, border=0, align=a, fill=fill)
@@ -880,7 +919,7 @@ def build_receipt_pdf(po_dict):
 
     # ── Total bar ─────────────────────────────────────────────────────────────────
     pdf.ln(1)
-    total_str   = fmt_currency(calc_po_total(po_dict))
+    total_str   = _pdf_safe(fmt_currency(calc_po_total(po_dict)))
     tot_label_w = pw - 40
     pdf.set_fill_color(*C_BLUE)
     pdf.set_text_color(*C_WHITE)
@@ -892,7 +931,7 @@ def build_receipt_pdf(po_dict):
     pdf.ln(8)
 
     # ── Notes ─────────────────────────────────────────────────────────────────────
-    notes = (po_dict.get("note") or "").strip()
+    notes = _pdf_safe((po_dict.get("note") or "").strip())
     if notes:
         pdf.ln(3)
         pdf.set_font("Helvetica", "B", 8)
