@@ -322,11 +322,11 @@ def save_vendor_cache(vendors_by_name):
 
 def fetch_vendor_data(api_key):
     """
-    Fetch all vendors with their 'Infor Vendor #' custom field via REST API.
+    Fetch all vendor data including 'Infor Vendor #' via the CSV export endpoint.
+    The REST API does not reliably return extraFields; the CSV always does.
 
     Returns {vendor_name_lower: {"id": int, "name": str, "infor_vendor_number": str|None}}.
-    Results are cached in VENDOR_CACHE_FILE for VENDOR_CACHE_TTL minutes.
-    Called once per cold-start (adds 1–2 API calls alongside the PO CSV call).
+    Cached in VENDOR_CACHE_FILE for VENDOR_CACHE_TTL minutes (one API call total).
     """
     cached = load_vendor_cache()
     age    = vendor_cache_age_minutes()
@@ -334,44 +334,39 @@ def fetch_vendor_data(api_key):
         print(f"  Vendor cache is {age:.0f}min old — using without API call.")
         return cached
 
-    print("  Fetching vendor list (for Infor Vendor # data)...")
+    print("  Fetching vendor data from CSV export endpoint...")
     session = requests.Session()
     session.headers.update({"Authorization": f"Bearer {api_key}"})
 
-    vendors_by_name = {}
-    cursor = None
-    while True:
-        params = {"limit": PAGE_SIZE}
-        if cursor:
-            params["cursor"] = cursor
-        try:
-            resp = _rl_get(session, f"{BASE_URL}/vendors", params=params)
-        except RateLimitError:
-            if cached:
-                print("  Rate limited on vendor fetch — using cached data.")
-                return cached
-            raise
+    try:
+        resp = _rl_get(session, f"{BASE_URL}/vendors/vendors.csv")
+    except RateLimitError:
+        if cached:
+            print("  Rate limited on vendor CSV fetch — using cached data.")
+            return cached
+        raise
 
-        body        = resp.json()
-        vendor_list = next((v for v in body.values() if isinstance(v, list)), [])
-        for v in vendor_list:
-            vid  = v.get("id")
-            name = (v.get("name") or "").strip()
-            if vid is not None and name:
-                extra     = v.get("extraFields") or {}
-                infor_num = (extra.get("Infor Vendor #") or "").strip() or None
-                vendors_by_name[name.lower()] = {
-                    "id":                 int(vid),
-                    "name":               name,
+    # Strip BOM (same issue as the PO CSV export)
+    text   = resp.content.decode("utf-8-sig")
+    reader = csv.DictReader(io.StringIO(text))
+
+    vendors_by_name = {}
+    for row in reader:
+        vendor_id   = (row.get("ID") or "").strip()
+        vendor_name = (row.get("Vendor") or "").strip()
+        infor_num   = (row.get("Infor Vendor #") or "").strip() or None
+        if vendor_id and vendor_name:
+            try:
+                vendors_by_name[vendor_name.lower()] = {
+                    "id":                  int(vendor_id),
+                    "name":                vendor_name,
                     "infor_vendor_number": infor_num,
                 }
-        cursor = body.get("nextCursor")
-        if not cursor or len(vendor_list) < PAGE_SIZE:
-            break
-        time.sleep(0.5)
+            except (ValueError, TypeError):
+                pass
 
     save_vendor_cache(vendors_by_name)
-    print(f"  Vendor data fetched — {len(vendors_by_name)} vendor(s).")
+    print(f"  Vendor CSV parsed — {len(vendors_by_name)} vendor(s).")
     return vendors_by_name
 
 
