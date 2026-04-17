@@ -241,8 +241,9 @@ def po_dashboard():
         pos = po.fetch_pos_from_csv(api_key)
         generated_at = datetime.now().strftime("%A, %B %d %Y at %I:%M %p")
         html = po.build_po_html(pos, generated_at)
+        html = html.encode("utf-8", errors="replace").decode("utf-8")
         _mem_set("po", html)
-        return Response(html, content_type="text/html")
+        return Response(html, content_type="text/html; charset=utf-8")
     except po.RateLimitError as e:
         return _rate_limit_page(e.reset_seconds)
     except Exception as e:
@@ -273,6 +274,7 @@ def po_refresh():
         pos = po.fetch_pos_from_csv(api_key)
         generated_at = datetime.now().strftime("%A, %B %d %Y at %I:%M %p")
         html = po.build_po_html(pos, generated_at)
+        html = html.encode("utf-8", errors="replace").decode("utf-8")
         _mem_set("po", html)
         banner = (
             '<div style="background:#dcfce7;border:1px solid #16a34a;border-radius:8px;'
@@ -280,7 +282,8 @@ def po_refresh():
             '&#10003; Refresh complete &mdash; data is up to date.'
             '</div>'
         )
-        return Response(html.replace("<body>", "<body>" + banner, 1), content_type="text/html")
+        return Response(html.replace("<body>", "<body>" + banner, 1),
+                        content_type="text/html; charset=utf-8")
     except po.RateLimitError as e:
         return _rate_limit_refresh_page(e.reset_seconds)
     except Exception as e:

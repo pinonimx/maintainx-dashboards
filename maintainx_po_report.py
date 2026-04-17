@@ -1005,7 +1005,7 @@ def build_po_html(pos, generated_at):
             f'<a href="/po/receipt/{po_id}" '
             f'style="display:inline-block;padding:3px 8px;background:#16a34a;color:#fff;'
             f'border-radius:5px;font-size:.75rem;font-weight:500;text-decoration:none;'
-            f'margin-left:4px" title="Download PDF receipt">&#128464;&nbsp;Receipt</a>'
+            f'margin-left:4px" title="Download PDF receipt">&#128196;&nbsp;Receipt</a>'
         ) if inv_raw == "Paid" else ""
 
         rows_html += f"""
@@ -1172,7 +1172,7 @@ function saveInvStatus(poId, btn) {{
             + 'color:#fff;border-radius:5px;font-size:.75rem;font-weight:500;'
             + 'text-decoration:none;margin-left:4px';
           a.title     = 'Download PDF receipt';
-          a.innerHTML = '\uD83D\uDCC4\u00A0Receipt';
+          a.innerHTML = '&#128196;&nbsp;Receipt';
           td.appendChild(a);
           existing = a;
         }}
@@ -1276,6 +1276,9 @@ applyFilters();
 </script>
 </body>
 </html>"""
+    # Final safety net: strip any stray surrogate code-points that could have
+    # been introduced by MaintainX field values embedded in table cells.
+    return html.encode("utf-8", errors="replace").decode("utf-8")
 
 
 # ── Email-safe HTML ───────────────────────────────────────────────────────────────
