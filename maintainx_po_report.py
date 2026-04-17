@@ -808,7 +808,7 @@ def build_receipt_pdf(po_dict):
     pdf.set_fill_color(*C_BLUE)
     pdf.set_text_color(*C_WHITE)
     pdf.set_font("Helvetica", "B", 18)
-    pdf.cell(pw, 11, "PAYMENT RECEIPT", border=0, align="C", fill=True)
+    pdf.cell(pw, 11, "PURCHASE ORDER RECEIPT", border=0, align="C", fill=True)
     pdf.ln(11)
     pdf.set_font("Helvetica", "", 9)
     pdf.cell(pw, 6, "Accounts Payable Department", border=0, align="C", fill=True)
@@ -841,7 +841,7 @@ def build_receipt_pdf(po_dict):
     right_items = [("Status",         status_lbl, None   ),
                    ("Approved",       approved,   None   ),
                    ("Due Date",       due,        None   ),
-                   ("Paid",           paid_date,  C_GREEN)]
+                   ("Posted Date",           paid_date,  C_GREEN)]
 
     for i, (label, value, color) in enumerate(left_items):
         pdf.set_xy(lx, sy + i * LH)
