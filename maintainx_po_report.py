@@ -694,18 +694,26 @@ def _extract_line_items(rows):
     """
     items = []
     for i, row in enumerate(rows, 1):
+        # Use MaintainX's own Line Number if present, fall back to row index
+        line_num_raw = (row.get("Line Number") or "").strip()
+        try:
+            line_num = int(float(line_num_raw)) if line_num_raw else i
+        except (ValueError, TypeError):
+            line_num = i
+
+        # Column names confirmed from live MaintainX CSV export header
         part_name = _get_csv_field(row,
-            "Part", "Item", "Description", "Part Name", "Item Name", "Line Name")
+            "Line Name", "Part Name", "Item Name", "Part", "Item", "Description")
         part_num  = _get_csv_field(row,
-            "Part #", "Part Number", "SKU", "Part No", "Part No.")
+            "Part Number", "Part #", "SKU", "Part No", "Part No.")
         unit_cost = _get_csv_field(row,
             "Unit Cost", "Unit Price", "Price")
         qty_ord   = _get_csv_field(row,
-            "Ordered", "Quantity Ordered", "Qty Ordered", "Ordered Qty", "Quantity", "Qty")
+            "Ordered Quantity", "Ordered", "Quantity Ordered", "Qty Ordered", "Ordered Qty", "Quantity", "Qty")
         qty_rcv   = _get_csv_field(row,
-            "Received", "Quantity Received", "Qty Received", "Received Qty")
+            "Received Quantity", "Received", "Quantity Received", "Qty Received", "Received Qty")
         line_tot  = _get_csv_field(row,
-            "Line Total", "Total Cost", "Ordered Cost", "Line Cost", "Amount")
+            "Ordered Cost", "Line Total", "Total Cost", "Line Cost", "Amount")
 
         def _to_float(s):
             try:
@@ -727,7 +735,7 @@ def _extract_line_items(rows):
             continue
 
         items.append({
-            "line_number":   i,
+            "line_number":   line_num,
             "part_name":     part_name,
             "part_number":   part_num,
             "unit_cost":     uc,
