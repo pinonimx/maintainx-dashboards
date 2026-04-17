@@ -177,8 +177,12 @@ def fetch_pos_from_csv(api_key):
             return _sort_pos(list(cache.values()))
         raise
 
-    # Parse CSV — multiple rows per PO (one per line item)
-    reader = csv.DictReader(io.StringIO(resp.text))
+    # Parse CSV — multiple rows per PO (one per line item).
+    # Decode with utf-8-sig to strip the BOM character that MaintainX prepends
+    # to the export; without this the first column key becomes "\ufeffPurchase Order #"
+    # and the lookup returns None, causing po_number() to fall back to the numeric ID.
+    text   = resp.content.decode("utf-8-sig")
+    reader = csv.DictReader(io.StringIO(text))
     groups: dict[str, list] = {}
     for row in reader:
         po_id = (row.get("Purchase Order ID") or "").strip()
