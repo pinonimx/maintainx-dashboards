@@ -19,8 +19,10 @@ import json
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
+import functools
 import requests as _http
-from flask import Flask, Response, render_template, request, jsonify
+from flask import (Flask, Response, render_template, request, jsonify,
+                   session, redirect, url_for)
 
 # ── Vercel detection ──────────────────────────────────────────────────────────────
 IS_VERCEL = os.environ.get("VERCEL") == "1"
@@ -33,6 +35,11 @@ if IS_VERCEL:
 import maintainx_dashboard as mxd
 
 app = Flask(__name__)
+
+# ── Session security ──────────────────────────────────────────────────────────────
+# SECRET_KEY signs the session cookie — set this in Vercel env vars.
+# APP_PASSWORD is the shared login password — also set in Vercel env vars.
+app.secret_key = os.environ.get("SECRET_KEY", "change-me-in-production")
 
 # ── Cache paths ───────────────────────────────────────────────────────────────────
 _TMP = Path("/tmp") if IS_VERCEL else Path(__file__).parent
@@ -86,6 +93,111 @@ def _file_set(path: Path, html: str):
         path.write_text(json.dumps(payload), encoding="utf-8")
     except Exception:
         pass
+
+
+# ── Auth ─────────────────────────────────────────────────────────────────────────
+
+def _check_password(entered):
+    """Compare entered password against APP_PASSWORD env var."""
+    expected = os.environ.get("APP_PASSWORD", "").strip()
+    if not expected:
+        return False          # no password configured → deny everyone
+    return entered.strip() == expected
+
+
+def login_required(f):
+    """Decorator: redirect to /login if the user is not authenticated."""
+    @functools.wraps(f)
+    def decorated(*args, **kwargs):
+        if not session.get("logged_in"):
+            return redirect(url_for("login", next=request.path))
+        return f(*args, **kwargs)
+    return decorated
+
+
+def _login_page(error=None):
+    err_block = (
+        f'<p style="color:#dc2626;font-size:.85rem;margin-top:8px">{error}</p>'
+        if error else ""
+    )
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Sign In</title>
+<style>
+  *{{box-sizing:border-box;margin:0;padding:0}}
+  body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+       background:#f1f5f9;display:flex;align-items:center;
+       justify-content:center;min-height:100vh}}
+  .card{{background:#fff;border-radius:12px;padding:40px 44px;
+        box-shadow:0 4px 24px rgba(0,0,0,.08);width:100%;max-width:380px}}
+  .logo{{text-align:center;margin-bottom:28px}}
+  .logo h1{{font-size:1.15rem;font-weight:700;color:#0f2d52;margin-top:10px}}
+  .logo p{{font-size:.8rem;color:#94a3b8;margin-top:3px}}
+  label{{display:block;font-size:.8rem;font-weight:600;color:#374151;margin-bottom:5px}}
+  input[type=password]{{width:100%;border:1px solid #d1d5db;border-radius:7px;
+    padding:10px 14px;font-size:.9rem;color:#1e293b;outline:none;
+    transition:border-color .15s,box-shadow .15s}}
+  input[type=password]:focus{{border-color:#2563eb;
+    box-shadow:0 0 0 3px rgba(37,99,235,.15)}}
+  button{{width:100%;margin-top:20px;padding:11px;background:#0f2d52;color:#fff;
+    border:none;border-radius:7px;font-size:.9rem;font-weight:600;
+    cursor:pointer;transition:background .15s}}
+  button:hover{{background:#1e40af}}
+</style>
+</head>
+<body>
+  <div class="card">
+    <div class="logo">
+      <svg width="40" height="40" viewBox="0 0 40 40" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <rect width="40" height="40" rx="10" fill="#0f2d52"/>
+        <path d="M12 28V14h6l2 4 2-4h6v14h-4v-8l-4 6-4-6v8z" fill="#fff"/>
+      </svg>
+      <h1>MaintainX Dashboards</h1>
+      <p>Accounts Payable Portal</p>
+    </div>
+    <form method="POST" action="/login">
+      <input type="hidden" name="next" value="{request.args.get('next', '/')}">
+      <label for="password">Password</label>
+      <input type="password" id="password" name="password"
+             placeholder="Enter your password" autofocus autocomplete="current-password">
+      {err_block}
+      <button type="submit">Sign In</button>
+    </form>
+  </div>
+</body>
+</html>"""
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if session.get("logged_in"):
+        return redirect(url_for("index"))
+
+    if request.method == "POST":
+        entered  = request.form.get("password", "")
+        next_url = request.form.get("next", "/")
+        if _check_password(entered):
+            session["logged_in"] = True
+            session.permanent    = False   # session ends when browser closes
+            # Safety: only redirect to internal paths
+            if not next_url.startswith("/") or next_url.startswith("//"):
+                next_url = "/"
+            return redirect(next_url)
+        return Response(
+            _login_page(error="Incorrect password. Please try again."),
+            status=401, content_type="text/html"
+        )
+
+    return Response(_login_page(), status=200, content_type="text/html")
+
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect(url_for("login"))
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────────
@@ -179,11 +291,13 @@ def _error_page(message, status=500):
 # ── Routes ────────────────────────────────────────────────────────────────────────
 
 @app.route("/")
+@login_required
 def index():
     return render_template("home.html")
 
 
 @app.route("/wo")
+@login_required
 def wo_dashboard():
     """Work Order dashboard with two-layer caching (memory + file)."""
     api_key = _get_api_key()
@@ -220,6 +334,7 @@ def wo_dashboard():
 
 
 @app.route("/po")
+@login_required
 def po_dashboard():
     """Purchase Order dashboard with two-layer caching (memory + file via po module)."""
     api_key = _get_api_key()
@@ -253,6 +368,7 @@ def po_dashboard():
 
 
 @app.route("/po/refresh")
+@login_required
 def po_refresh():
     """
     Force a fresh CSV pull from MaintainX, bypassing the 60-min cache.
@@ -337,6 +453,7 @@ def _rate_limit_refresh_page(wait_seconds=65):
 
 
 @app.route("/vendor/update-infor-number", methods=["POST"])
+@login_required
 def vendor_update_infor_number():
     """
     Update the 'Infor Vendor #' custom field on a vendor record.
@@ -404,6 +521,7 @@ def vendor_update_infor_number():
 
 
 @app.route("/po/update-status", methods=["POST"])
+@login_required
 def po_update_status():
     """
     Update the Invoice Status custom field on a single PO.
@@ -463,6 +581,7 @@ def po_update_status():
 
 
 @app.route("/po/receipt/<int:po_id>")
+@login_required
 def po_receipt(po_id):
     """
     Generate and stream a PDF payment receipt for a single PO.

@@ -1125,7 +1125,10 @@ def build_po_html(pos, generated_at):
       <div class="sub">Generated {generated_at}</div>
     </div>
   </div>
-  <a href="/po/refresh" title="Pull latest data from MaintainX" style="font-size:.8rem;color:#2563eb;text-decoration:none;padding:5px 12px;border:1px solid #bfdbfe;border-radius:6px;white-space:nowrap;background:#eff6ff;">&#8635; Refresh Data</a>
+  <div style="display:flex;gap:8px;align-items:center">
+    <a href="/po/refresh" title="Pull latest data from MaintainX" style="font-size:.8rem;color:#2563eb;text-decoration:none;padding:5px 12px;border:1px solid #bfdbfe;border-radius:6px;white-space:nowrap;background:#eff6ff;">&#8635; Refresh Data</a>
+    <a href="/logout" title="Sign out" style="font-size:.8rem;color:#6b7280;text-decoration:none;padding:5px 12px;border:1px solid #e2e8f0;border-radius:6px;white-space:nowrap;">&#x2192; Sign Out</a>
+  </div>
 </div>
 
 <div class="kpi-strip">
