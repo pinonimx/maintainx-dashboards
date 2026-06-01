@@ -1044,32 +1044,39 @@ def build_po_html(pos, generated_at):
             f'</div>'
         )
 
-        # ── Invoice Status cell ──────────────────────────────────────────────────
+        # ── Invoice Status cell — toggle buttons ────────────────────────────────
         inv_raw = (po.get("invoice_status") or "").strip()
-        if inv_raw == "Paid":
-            inv_opts = ('<option value="Paid" selected>Paid</option>'
-                        '<option value="Unpaid">Unpaid</option>')
-        elif inv_raw == "Unpaid":
-            inv_opts = ('<option value="Unpaid" selected>Unpaid</option>'
-                        '<option value="Paid">Paid</option>')
-        else:
-            inv_raw  = ""   # normalise NULL / unknown
-            inv_opts = ('<option value="" selected>&#8212; Not Set</option>'
-                        '<option value="Unpaid">Unpaid</option>')
+        if inv_raw not in ("Paid", "Unpaid"):
+            inv_raw = ""   # normalise NULL / unknown
 
-        # Download Receipt button — shown for already-Paid rows (server-rendered)
+        # Button styles: active vs inactive
+        _inactive = ("padding:4px 11px;border-radius:5px;font-size:.75rem;font-weight:600;"
+                     "cursor:pointer;border:1px solid #e2e8f0;background:#f8fafc;color:#94a3b8")
+        _active_unpaid = ("padding:4px 11px;border-radius:5px;font-size:.75rem;font-weight:600;"
+                          "cursor:pointer;border:1px solid #93c5fd;background:#dbeafe;color:#1d4ed8")
+        _active_paid   = ("padding:4px 11px;border-radius:5px;font-size:.75rem;font-weight:600;"
+                          "cursor:pointer;border:1px solid #86efac;background:#dcfce7;color:#15803d")
+
+        unpaid_style = _active_unpaid if inv_raw == "Unpaid" else _inactive
+        paid_style   = _active_paid   if inv_raw == "Paid"   else _inactive
+
+        # Receipt link — shown server-side for already-Paid rows
         receipt_btn = (
-            f'<a href="/po/receipt/{po_id}" '
-            f'style="display:inline-block;padding:3px 8px;background:#16a34a;color:#fff;'
-            f'border-radius:5px;font-size:.75rem;font-weight:500;text-decoration:none;'
-            f'margin-left:4px" title="Download PDF receipt">&#128196;&nbsp;Receipt</a>'
+            f'<a href="/po/receipt/{po_id}" class="receipt-link"'
+            f' style="display:inline-block;padding:4px 9px;background:#16a34a;color:#fff;'
+            f'border-radius:5px;font-size:.75rem;font-weight:600;text-decoration:none;'
+            f'margin-left:2px" title="Download PDF receipt">&#128196;&nbsp;Receipt</a>'
         ) if inv_raw == "Paid" else ""
 
         rows_html += f"""
         <tr class="po-row" data-status="{status}" data-vendor="{vendor}" data-invoice-status="{inv_raw}">
           <td style="font-weight:600;color:#1e40af;white-space:nowrap">{pnum}</td>
           <td style="white-space:nowrap">
-            <select id="inv-{po_id}" style="border:1px solid #d1d5db;border-radius:5px;padding:3px 7px;font-size:.78rem;color:#374151;background:#fff;margin-right:4px">{inv_opts}</select><button onclick="saveInvStatus({po_id},this)" style="padding:3px 8px;background:#2563eb;color:#fff;border:none;border-radius:5px;font-size:.75rem;cursor:pointer;font-weight:500">Save</button>{receipt_btn}
+            <div style="display:flex;gap:4px;align-items:center;flex-wrap:wrap">
+              <button class="inv-btn" data-val="Unpaid" onclick="setInvStatus({po_id},'Unpaid',this)" style="{unpaid_style}">Unpaid</button>
+              <button class="inv-btn" data-val="Paid"   onclick="setInvStatus({po_id},'Paid',this)"   style="{paid_style}">Paid</button>
+              {receipt_btn}
+            </div>
           </td>
           <td>{vendor}{f'<div style="font-size:.78rem;color:#6b7280;margin-top:2px">{title}</div>' if not _title_redundant(title_raw, vendor_raw) else ''}{infor_sub}</td>
           <td><span style="display:inline-block;padding:3px 10px;border-radius:12px;font-size:.78rem;font-weight:600;background:{bg};color:{color}">{label}</span></td>
@@ -1202,13 +1209,13 @@ def build_po_html(pos, generated_at):
 </div>
 
 <script>
-function saveInvStatus(poId, btn) {{
-  var sel     = document.getElementById('inv-' + poId);
-  var newVal  = sel.value;
-  var origTxt = btn.textContent;
-  btn.textContent      = 'Saving\u2026';
-  btn.disabled         = true;
-  btn.style.background = '#6b7280';
+function setInvStatus(poId, newVal, clickedBtn) {{
+  var td   = clickedBtn.closest('td');
+  var btns = td.querySelectorAll('.inv-btn');
+
+  // Disable all buttons while saving
+  btns.forEach(function(b) {{ b.disabled = true; b.style.opacity = '.5'; }});
+
   fetch('/po/update-status', {{
     method:  'POST',
     headers: {{'Content-Type': 'application/json'}},
@@ -1216,55 +1223,57 @@ function saveInvStatus(poId, btn) {{
   }})
   .then(function(r) {{ return r.json(); }})
   .then(function(data) {{
+    btns.forEach(function(b) {{ b.disabled = false; b.style.opacity = '1'; }});
     if (data.ok) {{
-      btn.textContent      = '\u2713 Saved';
-      btn.style.background = '#16a34a';
-      sel.closest('tr').dataset.invoiceStatus = newVal;
+      // Update button visual states
+      btns.forEach(function(b) {{
+        var v = b.dataset.val;
+        if (v === newVal) {{
+          if (v === 'Paid') {{
+            b.style.cssText = 'padding:4px 11px;border-radius:5px;font-size:.75rem;font-weight:600;cursor:pointer;border:1px solid #86efac;background:#dcfce7;color:#15803d';
+          }} else {{
+            b.style.cssText = 'padding:4px 11px;border-radius:5px;font-size:.75rem;font-weight:600;cursor:pointer;border:1px solid #93c5fd;background:#dbeafe;color:#1d4ed8';
+          }}
+        }} else {{
+          b.style.cssText = 'padding:4px 11px;border-radius:5px;font-size:.75rem;font-weight:600;cursor:pointer;border:1px solid #e2e8f0;background:#f8fafc;color:#94a3b8';
+        }}
+      }});
+
+      // Update row filter attribute
+      clickedBtn.closest('tr').dataset.invoiceStatus = newVal;
 
       if (newVal === 'Paid') {{
-        // Add / update the Receipt download link next to the Save button
-        var td = sel.closest('td');
+        // Add receipt link if not already there
         var existing = td.querySelector('.receipt-link');
         if (!existing) {{
           var a = document.createElement('a');
           a.className   = 'receipt-link';
-          a.style.cssText = 'display:inline-block;padding:3px 8px;background:#16a34a;'
-            + 'color:#fff;border-radius:5px;font-size:.75rem;font-weight:500;'
-            + 'text-decoration:none;margin-left:4px';
+          a.style.cssText = 'display:inline-block;padding:4px 9px;background:#16a34a;'
+            + 'color:#fff;border-radius:5px;font-size:.75rem;font-weight:600;'
+            + 'text-decoration:none;margin-left:2px';
           a.title     = 'Download PDF receipt';
           a.innerHTML = '&#128196;&nbsp;Receipt';
-          td.appendChild(a);
+          td.querySelector('div').appendChild(a);
           existing = a;
         }}
         existing.href = '/po/receipt/' + poId;
-        // Auto-trigger download (browser stays on page because Content-Disposition: attachment)
         setTimeout(function() {{ window.location.href = '/po/receipt/' + poId; }}, 350);
-        // Hide row after a brief delay (filter will remove it from "unpaid-pending" view)
         setTimeout(function() {{ applyFilters(); }}, 900);
       }} else {{
-        // Remove receipt link if status moved away from Paid
-        var existing = sel.closest('td').querySelector('.receipt-link');
+        // Remove receipt link if present
+        var existing = td.querySelector('.receipt-link');
         if (existing) {{ existing.remove(); }}
         setTimeout(function() {{ applyFilters(); }}, 400);
       }}
     }} else {{
-      btn.textContent      = 'Error';
-      btn.style.background = '#dc2626';
+      clickedBtn.style.cssText += ';outline:2px solid #dc2626';
+      setTimeout(function() {{ clickedBtn.style.outline = ''; }}, 2000);
     }}
-    setTimeout(function() {{
-      btn.textContent      = origTxt;
-      btn.style.background = '#2563eb';
-      btn.disabled         = false;
-    }}, 2000);
   }})
   .catch(function() {{
-    btn.textContent      = 'Error';
-    btn.style.background = '#dc2626';
-    setTimeout(function() {{
-      btn.textContent      = origTxt;
-      btn.style.background = '#2563eb';
-      btn.disabled         = false;
-    }}, 2000);
+    btns.forEach(function(b) {{ b.disabled = false; b.style.opacity = '1'; }});
+    clickedBtn.style.cssText += ';outline:2px solid #dc2626';
+    setTimeout(function() {{ clickedBtn.style.outline = ''; }}, 2000);
   }});
 }}
 
