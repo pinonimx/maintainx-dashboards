@@ -587,7 +587,7 @@ def po_receipt(po_id):
     Generate and stream a PDF payment receipt for a single PO.
     Built on-demand from the PO cache — no file storage required.
     """
-    # Read PO from cache
+    # Try cache first
     po_dict = None
     try:
         cached  = json.loads(po.CACHE_FILE.read_text(encoding="utf-8"))
@@ -595,10 +595,19 @@ def po_receipt(po_id):
     except Exception:
         pass
 
+    # Cache miss (cold container on Vercel) — re-fetch CSV to find the PO
+    if not po_dict:
+        api_key = _get_api_key()
+        if api_key:
+            try:
+                pos_list = po.fetch_pos_from_csv(api_key)
+                po_dict  = next((p for p in pos_list if p.get("id") == po_id), None)
+            except Exception:
+                pass
+
     if not po_dict:
         return _error_page(
-            f"PO {po_id} was not found in the cache. "
-            "Please refresh the dashboard and try again.",
+            f"PO {po_id} was not found. Please refresh the dashboard and try again.",
             status=404,
         )
 
