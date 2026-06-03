@@ -56,6 +56,17 @@ STATUS_BG = {
     "PARTIALLY_FULFILLED": "#fef9c3",
 }
 
+# Purchasing Category pill colours — one distinct colour per category
+CATEGORY_STYLE = {
+    "TMC": {"bg": "#dbeafe", "color": "#1d4ed8"},   # blue
+    "TMF": {"bg": "#ede9fe", "color": "#6d28d9"},   # purple
+    "TMR": {"bg": "#ffedd5", "color": "#c2410c"},   # orange
+    "TMP": {"bg": "#ccfbf1", "color": "#0f766e"},   # teal
+    "TE":  {"bg": "#fee2e2", "color": "#b91c1c"},   # red
+    # fallback for any future categories
+    "_default": {"bg": "#f1f5f9", "color": "#475569"},
+}
+
 # ── Rate-limit helpers ────────────────────────────────────────────────────────────
 
 class RateLimitError(Exception):
@@ -218,22 +229,25 @@ def fetch_pos_from_csv(api_key):
             first.get("Approver") or ""
         ).strip()
 
+        purchasing_category = _sanitize((first.get("Purchasing Category") or "").strip())
+
         pos_by_id[po_id] = {
-            "id":            int(po_id),
-            "overrideNumber": _sanitize((first.get("Purchase Order #") or "").strip()),
-            "title":         _sanitize((first.get("Purchase Order Title") or "").strip()),
-            "vendorName":    _sanitize((first.get("Vendor") or "").strip()) or "Unknown Vendor",
-            "status":        status,
-            "note":          _sanitize((first.get("Notes") or "").strip()),
-            "approvalDate":  _parse_csv_date(first.get("Approved On")),
-            "updatedAt":     _parse_csv_date(
-                                 first.get("Completed On") or first.get("Approved On")
-                             ),
-            "dueDate":       _parse_csv_date(first.get("Due Date")),
-            "invoice_status": invoice_status,
-            "_total":        total,   # pre-computed; picked up by calc_po_total()
-            "approver_name": _sanitize(approver_name),
-            "line_items":    _extract_line_items(rows),
+            "id":                  int(po_id),
+            "overrideNumber":      _sanitize((first.get("Purchase Order #") or "").strip()),
+            "title":               _sanitize((first.get("Purchase Order Title") or "").strip()),
+            "vendorName":          _sanitize((first.get("Vendor") or "").strip()) or "Unknown Vendor",
+            "status":              status,
+            "note":                _sanitize((first.get("Notes") or "").strip()),
+            "approvalDate":        _parse_csv_date(first.get("Approved On")),
+            "updatedAt":           _parse_csv_date(
+                                       first.get("Completed On") or first.get("Approved On")
+                                   ),
+            "dueDate":             _parse_csv_date(first.get("Due Date")),
+            "invoice_status":      invoice_status,
+            "_total":              total,
+            "approver_name":       _sanitize(approver_name),
+            "purchasing_category": purchasing_category,
+            "line_items":          _extract_line_items(rows),
         }
 
     # ── Enrich POs with vendor ID and Infor Vendor # ──────────────────────────────
@@ -1002,7 +1016,8 @@ def build_po_html(pos, generated_at):
     known     = [t for t in totals if t is not None]
     total_val = fmt_currency(sum(known)) if known else "—"
 
-    vendors = sorted(set(p.get("vendorName", "Unknown Vendor") for p in pos))
+    vendors    = sorted(set(p.get("vendorName", "Unknown Vendor") for p in pos))
+    categories = sorted(set(p.get("purchasing_category", "") for p in pos if p.get("purchasing_category")))
 
     rows_html = ""
     for i, (po, total) in enumerate(zip(pos, totals)):
@@ -1020,6 +1035,15 @@ def build_po_html(pos, generated_at):
         due        = fmt_date(po.get("dueDate"))
         amt        = fmt_currency(total)
         po_id      = po.get("id", 0)
+
+        # ── Purchasing Category pill ─────────────────────────────────────────────
+        cat_raw   = (po.get("purchasing_category") or "").strip()
+        cat_style = CATEGORY_STYLE.get(cat_raw, CATEGORY_STYLE["_default"])
+        cat_pill  = (
+            f'<span style="display:inline-block;padding:3px 10px;border-radius:12px;'
+            f'font-size:.78rem;font-weight:600;background:{cat_style["bg"]};'
+            f'color:{cat_style["color"]}">{_esc(cat_raw) if cat_raw else "—"}</span>'
+        )
 
         # ── Infor Vendor # sub-row (lives inside the Vendor cell) ───────────────
         vendor_id      = po.get("vendor_id")
@@ -1069,8 +1093,9 @@ def build_po_html(pos, generated_at):
         ) if inv_raw == "Paid" else ""
 
         rows_html += f"""
-        <tr class="po-row" data-status="{status}" data-vendor="{vendor}" data-invoice-status="{inv_raw}">
+        <tr class="po-row" data-status="{status}" data-vendor="{vendor}" data-invoice-status="{inv_raw}" data-category="{_esc(cat_raw)}">
           <td style="font-weight:600;color:#1e40af;white-space:nowrap">{pnum}</td>
+          <td style="white-space:nowrap">{cat_pill}</td>
           <td style="white-space:nowrap">
             <div style="display:flex;gap:4px;align-items:center;flex-wrap:wrap">
               <button class="inv-btn" data-val="Unpaid" onclick="setInvStatus({po_id},'Unpaid',this)" style="{unpaid_style}">Unpaid</button>
@@ -1179,6 +1204,11 @@ def build_po_html(pos, generated_at):
           <option value="COMPLETED">Ready to Pay</option>
           <option value="PARTIALLY_FULFILLED">Partial Receipt</option>
         </select>
+        <select id="categoryFilter" onchange="applyFilters()">
+          <option value="">All Categories</option>
+          <option value="__none__">No Category</option>
+          {chr(10).join(f'<option value="{_esc(c)}">{_esc(c)}</option>' for c in categories)}
+        </select>
         <select id="vendorFilter" onchange="applyFilters()">
           <option value="">All Vendors</option>
           {vendor_options}
@@ -1191,6 +1221,7 @@ def build_po_html(pos, generated_at):
         <thead>
           <tr>
             <th>PO #</th>
+            <th>Category</th>
             <th>Invoice Status</th>
             <th>Vendor</th>
             <th>Status</th>
@@ -1201,7 +1232,7 @@ def build_po_html(pos, generated_at):
           </tr>
         </thead>
         <tbody id="poBody">
-          {rows_html if rows_html else '<tr><td colspan="8" class="empty">No completed purchase orders found.</td></tr>'}
+          {rows_html if rows_html else '<tr><td colspan="9" class="empty">No completed purchase orders found.</td></tr>'}
         </tbody>
       </table>
     </div>
@@ -1317,14 +1348,16 @@ function saveInforNum(poId, vendorId, btn) {{
 }}
 
 function applyFilters() {{
-  var search  = document.getElementById('search').value.toLowerCase();
-  var status  = document.getElementById('statusFilter').value;
-  var vendor  = document.getElementById('vendorFilter').value;
-  var invFilt = document.getElementById('invoiceFilter').value;
-  var rows    = document.querySelectorAll('#poBody .po-row');
-  var visible = 0;
+  var search   = document.getElementById('search').value.toLowerCase();
+  var status   = document.getElementById('statusFilter').value;
+  var vendor   = document.getElementById('vendorFilter').value;
+  var invFilt  = document.getElementById('invoiceFilter').value;
+  var catFilt  = document.getElementById('categoryFilter').value;
+  var rows     = document.querySelectorAll('#poBody .po-row');
+  var visible  = 0;
   rows.forEach(function(row) {{
     var inv          = row.dataset.invoiceStatus;
+    var cat          = row.dataset.category || '';
     var matchSearch  = !search || row.textContent.toLowerCase().includes(search);
     var matchStatus  = !status || row.dataset.status === status;
     var matchVendor  = !vendor || row.dataset.vendor === vendor;
@@ -1333,7 +1366,10 @@ function applyFilters() {{
     else if (invFilt === 'unpaid')         {{ matchInvoice = inv === 'Unpaid'; }}
     else if (invFilt === 'pending')        {{ matchInvoice = inv === ''; }}
     else if (invFilt === 'paid')           {{ matchInvoice = inv === 'Paid'; }}
-    var show = matchSearch && matchStatus && matchVendor && matchInvoice;
+    var matchCategory = true;
+    if      (catFilt === '__none__') {{ matchCategory = cat === ''; }}
+    else if (catFilt)                {{ matchCategory = cat === catFilt; }}
+    var show = matchSearch && matchStatus && matchVendor && matchInvoice && matchCategory;
     row.style.display = show ? '' : 'none';
     if (show) visible++;
   }});
