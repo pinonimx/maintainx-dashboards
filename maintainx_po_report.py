@@ -221,6 +221,12 @@ def fetch_pos_from_csv(api_key):
         except (ValueError, TypeError):
             total = None
 
+        # Total Received Cost — what has actually been received so far (includes tax)
+        try:
+            total_received = float((first.get("Total Received Cost") or "0").replace(",", ""))
+        except (ValueError, TypeError):
+            total_received = None
+
         invoice_status = (first.get("Invoice Status") or "").strip() or None
 
         # Approver name — try common column name variants
@@ -245,6 +251,7 @@ def fetch_pos_from_csv(api_key):
             "dueDate":             _parse_csv_date(first.get("Due Date")),
             "invoice_status":      invoice_status,
             "_total":              total,
+            "_total_received":     total_received,
             "approver_name":       _sanitize(approver_name),
             "purchasing_category": purchasing_category,
             "line_items":          _extract_line_items(rows),
@@ -728,6 +735,8 @@ def _extract_line_items(rows):
             "Received Quantity", "Received", "Quantity Received", "Qty Received", "Received Qty")
         line_tot  = _get_csv_field(row,
             "Ordered Cost", "Line Total", "Total Cost", "Line Cost", "Amount")
+        rcv_cost  = _get_csv_field(row,
+            "Received Cost")
 
         def _to_float(s):
             try:
@@ -739,10 +748,15 @@ def _extract_line_items(rows):
         qo = _to_float(qty_ord)
         qr = _to_float(qty_rcv)
         lt = _to_float(line_tot)
+        rc = _to_float(rcv_cost)
 
         # Compute line total if missing
         if lt is None and uc is not None and qo is not None:
             lt = round(uc * qo, 2)
+
+        # Compute received cost if missing
+        if rc is None and uc is not None and qr is not None:
+            rc = round(uc * qr, 2)
 
         # Skip rows with no meaningful content (blank line item rows)
         if not part_name and not part_num and uc is None and qo is None:
@@ -755,7 +769,8 @@ def _extract_line_items(rows):
             "unit_cost":     uc,
             "qty_ordered":   qo,
             "qty_received":  qr,
-            "line_total":    lt,
+            "line_total":    lt,    # ordered cost (full qty)
+            "received_cost": rc,    # cost of received qty only
         })
     return items
 
@@ -837,10 +852,13 @@ def build_receipt_pdf(po_dict):
     pw = pdf.w - 30   # usable page width (A4 210 mm − 30 mm margins)
 
     # ── Header band ───────────────────────────────────────────────────────────────
+    is_partial  = (po_dict.get("invoice_status") or "").strip() == "Partially Paid"
+    header_text = "PARTIAL PAYMENT RECEIPT" if is_partial else "PURCHASE ORDER RECEIPT"
+
     pdf.set_fill_color(*C_BLUE)
     pdf.set_text_color(*C_WHITE)
     pdf.set_font("Helvetica", "B", 18)
-    pdf.cell(pw, 11, "PURCHASE ORDER RECEIPT", border=0, align="C", fill=True)
+    pdf.cell(pw, 11, header_text, border=0, align="C", fill=True)
     pdf.ln(11)
     pdf.set_font("Helvetica", "", 9)
     pdf.cell(pw, 6, "Accounts Payable Department", border=0, align="C", fill=True)
@@ -908,12 +926,17 @@ def build_receipt_pdf(po_dict):
     pdf.ln(6)
 
     # ── Line items table ──────────────────────────────────────────────────────────
-    line_items = po_dict.get("line_items") or []
-    fixed_w = 8 + 28 + 16 + 16 + 24 + 24   # sum of all fixed columns
+    # Only include lines where items have actually been received
+    all_items  = po_dict.get("line_items") or []
+    line_items = [item for item in all_items
+                  if (item.get("qty_received") or 0) > 0]
+
+    # Simplified columns for a payment receipt (received qty only)
+    fixed_w = 8 + 28 + 18 + 26 + 26   # sum of all fixed columns
     desc_w  = pw - fixed_w
-    col_w   = [8, desc_w, 28, 16, 16, 24, 24]
-    headers = ["#", "Description", "Part #", "Qty Ord", "Qty Rcv", "Unit Cost", "Line Total"]
-    aligns  = ["C", "L",           "L",      "R",       "R",       "R",         "R"         ]
+    col_w   = [8, desc_w, 28, 18, 26, 26]
+    headers = ["#", "Description", "Part #", "Qty Rcvd", "Unit Cost", "Amount"]
+    aligns  = ["C", "L",           "L",      "R",        "R",         "R"     ]
     TH      = 6   # table row height
 
     # Header row
@@ -924,20 +947,21 @@ def build_receipt_pdf(po_dict):
         pdf.cell(w, TH, h_text, border=0, align=a, fill=True)
     pdf.ln(TH)
 
-    # Data rows
+    # Data rows — use received qty and received cost
     pdf.set_font("Helvetica", "", 8)
     for idx, item in enumerate(line_items):
         fill = (idx % 2 == 1)
         pdf.set_fill_color(*C_LGRAY)
         pdf.set_text_color(*C_BLACK)
+        # Use received_cost for amount; fall back to computing from unit_cost × qty_received
+        rcv_cost = item.get("received_cost")
         row_data = [
             str(item.get("line_number", idx + 1)),
             _pdf_safe((item.get("part_name")   or "")[:60]),
             _pdf_safe((item.get("part_number") or "")[:18]),
-            _pdf_safe(_fmt_qty(item.get("qty_ordered"))),
             _pdf_safe(_fmt_qty(item.get("qty_received"))),
             _pdf_safe(fmt_currency(item.get("unit_cost"))),
-            _pdf_safe(fmt_currency(item.get("line_total"))),
+            _pdf_safe(fmt_currency(rcv_cost)),
         ]
         for w, d, a in zip(col_w, row_data, aligns):
             pdf.cell(w, TH, d, border=0, align=a, fill=fill)
@@ -946,17 +970,20 @@ def build_receipt_pdf(po_dict):
     if not line_items:
         pdf.set_text_color(*C_DGRAY)
         pdf.set_font("Helvetica", "I", 8)
-        pdf.cell(pw, TH, "No line item data available.", border=0, align="C")
+        pdf.cell(pw, TH, "No received items to display.", border=0, align="C")
         pdf.ln(TH)
 
     # ── Total bar ─────────────────────────────────────────────────────────────────
+    # Use Total Received Cost (includes tax, MaintainX-calculated) for receipt total
     pdf.ln(1)
-    total_str   = _pdf_safe(fmt_currency(calc_po_total(po_dict)))
-    tot_label_w = pw - 40
+    receipt_total = po_dict.get("_total_received") or calc_po_total(po_dict)
+    total_str     = _pdf_safe(fmt_currency(receipt_total))
+    total_label   = "RECEIVED TOTAL" if is_partial else "ORDER TOTAL"
+    tot_label_w   = pw - 40
     pdf.set_fill_color(*C_BLUE)
     pdf.set_text_color(*C_WHITE)
     pdf.set_font("Helvetica", "B", 9)
-    pdf.cell(tot_label_w, 8, "ORDER TOTAL", border=0, align="R", fill=True)
+    pdf.cell(tot_label_w, 8, total_label, border=0, align="R", fill=True)
     pdf.set_fill_color(*C_GREEN)
     pdf.set_font("Helvetica", "B", 10)
     pdf.cell(40, 8, total_str, border=0, align="C", fill=True)
@@ -1033,7 +1060,14 @@ def build_po_html(pos, generated_at):
         note       = _esc((po.get("note") or "").replace("\n", " ")[:120])
         approved   = fmt_date(po.get("approvalDate") or po.get("updatedAt"))
         due        = fmt_date(po.get("dueDate"))
-        amt        = fmt_currency(total)
+        # For partially fulfilled POs show received / ordered so AP sees what's payable now
+        total_received = po.get("_total_received")
+        if status == "PARTIALLY_FULFILLED" and total_received is not None:
+            amt = (f'{fmt_currency(total_received)}'
+                   f'<span style="color:#94a3b8;font-size:.75rem;font-weight:400">'
+                   f'&nbsp;/&nbsp;{fmt_currency(total)}</span>')
+        else:
+            amt = fmt_currency(total)
         po_id      = po.get("id", 0)
 
         # ── Purchasing Category pill ─────────────────────────────────────────────
@@ -1068,38 +1102,41 @@ def build_po_html(pos, generated_at):
             f'</div>'
         )
 
-        # ── Invoice Status cell — toggle buttons ────────────────────────────────
+        # ── Invoice Status cell — 3 toggle buttons ──────────────────────────────
         inv_raw = (po.get("invoice_status") or "").strip()
-        if inv_raw not in ("Paid", "Unpaid"):
+        if inv_raw not in ("Paid", "Unpaid", "Partially Paid"):
             inv_raw = ""   # normalise NULL / unknown
 
-        # Button styles: active vs inactive
-        _inactive = ("padding:4px 11px;border-radius:5px;font-size:.75rem;font-weight:600;"
+        _inactive = ("padding:4px 9px;border-radius:5px;font-size:.73rem;font-weight:600;"
                      "cursor:pointer;border:1px solid #e2e8f0;background:#f8fafc;color:#94a3b8")
-        _active_unpaid = ("padding:4px 11px;border-radius:5px;font-size:.75rem;font-weight:600;"
-                          "cursor:pointer;border:1px solid #93c5fd;background:#dbeafe;color:#1d4ed8")
-        _active_paid   = ("padding:4px 11px;border-radius:5px;font-size:.75rem;font-weight:600;"
-                          "cursor:pointer;border:1px solid #86efac;background:#dcfce7;color:#15803d")
+        _active_unpaid  = ("padding:4px 9px;border-radius:5px;font-size:.73rem;font-weight:600;"
+                           "cursor:pointer;border:1px solid #93c5fd;background:#dbeafe;color:#1d4ed8")
+        _active_partial = ("padding:4px 9px;border-radius:5px;font-size:.73rem;font-weight:600;"
+                           "cursor:pointer;border:1px solid #fcd34d;background:#fef3c7;color:#92400e")
+        _active_paid    = ("padding:4px 9px;border-radius:5px;font-size:.73rem;font-weight:600;"
+                           "cursor:pointer;border:1px solid #86efac;background:#dcfce7;color:#15803d")
 
-        unpaid_style = _active_unpaid if inv_raw == "Unpaid" else _inactive
-        paid_style   = _active_paid   if inv_raw == "Paid"   else _inactive
+        unpaid_style  = _active_unpaid  if inv_raw == "Unpaid"         else _inactive
+        partial_style = _active_partial if inv_raw == "Partially Paid" else _inactive
+        paid_style    = _active_paid    if inv_raw == "Paid"           else _inactive
 
-        # Receipt link — shown server-side for already-Paid rows
+        # Receipt link — shown for Partially Paid and Paid rows
         receipt_btn = (
             f'<a href="/po/receipt/{po_id}" class="receipt-link"'
             f' style="display:inline-block;padding:4px 9px;background:#16a34a;color:#fff;'
-            f'border-radius:5px;font-size:.75rem;font-weight:600;text-decoration:none;'
+            f'border-radius:5px;font-size:.73rem;font-weight:600;text-decoration:none;'
             f'margin-left:2px" title="Download PDF receipt">&#128196;&nbsp;Receipt</a>'
-        ) if inv_raw == "Paid" else ""
+        ) if inv_raw in ("Paid", "Partially Paid") else ""
 
         rows_html += f"""
         <tr class="po-row" data-status="{status}" data-vendor="{vendor}" data-invoice-status="{inv_raw}" data-category="{_esc(cat_raw)}">
           <td style="font-weight:600;color:#1e40af;white-space:nowrap">{pnum}</td>
           <td style="white-space:nowrap">{cat_pill}</td>
           <td style="white-space:nowrap">
-            <div style="display:flex;gap:4px;align-items:center;flex-wrap:wrap">
-              <button class="inv-btn" data-val="Unpaid" onclick="setInvStatus({po_id},'Unpaid',this)" style="{unpaid_style}">Unpaid</button>
-              <button class="inv-btn" data-val="Paid"   onclick="setInvStatus({po_id},'Paid',this)"   style="{paid_style}">Paid</button>
+            <div style="display:flex;gap:3px;align-items:center;flex-wrap:wrap">
+              <button class="inv-btn" data-val="Unpaid"         onclick="setInvStatus({po_id},'Unpaid',this)"         style="{unpaid_style}">Unpaid</button>
+              <button class="inv-btn" data-val="Partially Paid" onclick="setInvStatus({po_id},'Partially Paid',this)" style="{partial_style}">Partial</button>
+              <button class="inv-btn" data-val="Paid"           onclick="setInvStatus({po_id},'Paid',this)"           style="{paid_style}">Paid</button>
               {receipt_btn}
             </div>
           </td>
@@ -1193,10 +1230,11 @@ def build_po_html(pos, generated_at):
       <div class="filters">
         <input type="text" id="search" placeholder="Search PO # or vendor..." oninput="applyFilters()">
         <select id="invoiceFilter" onchange="applyFilters()">
-          <option value="unpaid-pending">Unpaid &amp; Pending</option>
+          <option value="unpaid-pending">Needs Payment</option>
           <option value="all">All (incl. Paid)</option>
           <option value="unpaid">Unpaid Only</option>
-          <option value="pending">Pending Only</option>
+          <option value="partial">Partially Paid Only</option>
+          <option value="pending">Not Set Only</option>
           <option value="paid">Paid Only</option>
         </select>
         <select id="statusFilter" onchange="applyFilters()">
@@ -1261,26 +1299,28 @@ function setInvStatus(poId, newVal, clickedBtn) {{
         var v = b.dataset.val;
         if (v === newVal) {{
           if (v === 'Paid') {{
-            b.style.cssText = 'padding:4px 11px;border-radius:5px;font-size:.75rem;font-weight:600;cursor:pointer;border:1px solid #86efac;background:#dcfce7;color:#15803d';
+            b.style.cssText = 'padding:4px 9px;border-radius:5px;font-size:.73rem;font-weight:600;cursor:pointer;border:1px solid #86efac;background:#dcfce7;color:#15803d';
+          }} else if (v === 'Partially Paid') {{
+            b.style.cssText = 'padding:4px 9px;border-radius:5px;font-size:.73rem;font-weight:600;cursor:pointer;border:1px solid #fcd34d;background:#fef3c7;color:#92400e';
           }} else {{
-            b.style.cssText = 'padding:4px 11px;border-radius:5px;font-size:.75rem;font-weight:600;cursor:pointer;border:1px solid #93c5fd;background:#dbeafe;color:#1d4ed8';
+            b.style.cssText = 'padding:4px 9px;border-radius:5px;font-size:.73rem;font-weight:600;cursor:pointer;border:1px solid #93c5fd;background:#dbeafe;color:#1d4ed8';
           }}
         }} else {{
-          b.style.cssText = 'padding:4px 11px;border-radius:5px;font-size:.75rem;font-weight:600;cursor:pointer;border:1px solid #e2e8f0;background:#f8fafc;color:#94a3b8';
+          b.style.cssText = 'padding:4px 9px;border-radius:5px;font-size:.73rem;font-weight:600;cursor:pointer;border:1px solid #e2e8f0;background:#f8fafc;color:#94a3b8';
         }}
       }});
 
       // Update row filter attribute
       clickedBtn.closest('tr').dataset.invoiceStatus = newVal;
 
-      if (newVal === 'Paid') {{
-        // Add receipt link if not already there
+      if (newVal === 'Paid' || newVal === 'Partially Paid') {{
+        // Add / update receipt link
         var existing = td.querySelector('.receipt-link');
         if (!existing) {{
           var a = document.createElement('a');
           a.className   = 'receipt-link';
           a.style.cssText = 'display:inline-block;padding:4px 9px;background:#16a34a;'
-            + 'color:#fff;border-radius:5px;font-size:.75rem;font-weight:600;'
+            + 'color:#fff;border-radius:5px;font-size:.73rem;font-weight:600;'
             + 'text-decoration:none;margin-left:2px';
           a.title     = 'Download PDF receipt';
           a.innerHTML = '&#128196;&nbsp;Receipt';
@@ -1291,7 +1331,7 @@ function setInvStatus(poId, newVal, clickedBtn) {{
         setTimeout(function() {{ window.location.href = '/po/receipt/' + poId; }}, 350);
         setTimeout(function() {{ applyFilters(); }}, 900);
       }} else {{
-        // Remove receipt link if present
+        // Remove receipt link if present (Unpaid or not-set)
         var existing = td.querySelector('.receipt-link');
         if (existing) {{ existing.remove(); }}
         setTimeout(function() {{ applyFilters(); }}, 400);
@@ -1364,6 +1404,7 @@ function applyFilters() {{
     var matchInvoice = true;
     if      (invFilt === 'unpaid-pending') {{ matchInvoice = inv !== 'Paid'; }}
     else if (invFilt === 'unpaid')         {{ matchInvoice = inv === 'Unpaid'; }}
+    else if (invFilt === 'partial')        {{ matchInvoice = inv === 'Partially Paid'; }}
     else if (invFilt === 'pending')        {{ matchInvoice = inv === ''; }}
     else if (invFilt === 'paid')           {{ matchInvoice = inv === 'Paid'; }}
     var matchCategory = true;
