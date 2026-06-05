@@ -28,9 +28,6 @@ from flask import (Flask, Response, render_template, request, jsonify,
 IS_VERCEL = os.environ.get("VERCEL") == "1"
 
 import maintainx_po_report as po
-if IS_VERCEL:
-    po.CACHE_FILE        = Path("/tmp/po_cache.json")
-    po.VENDOR_CACHE_FILE = Path("/tmp/vendor_cache.json")
 
 import maintainx_dashboard as mxd
 
@@ -41,9 +38,35 @@ app = Flask(__name__)
 # APP_PASSWORD is the shared login password — also set in Vercel env vars.
 app.secret_key = os.environ.get("SECRET_KEY", "change-me-in-production")
 
+# ── Site configuration ────────────────────────────────────────────────────────────
+SITES = {
+    "mckinney": {
+        "label":       "McKinney",
+        "badge_color": "#1d4ed8",
+        "badge_bg":    "#dbeafe",
+        "api_key_env": "MAINTAINX_API_KEY",          # existing env var
+        "po_cache":    "po_cache_mckinney.json",
+        "vendor_cache":"vendor_cache_mckinney.json",
+        "wo_cache":    "wo_html_cache_mckinney.json",
+    },
+    "mtvernon": {
+        "label":       "Mt. Vernon",
+        "badge_color": "#6d28d9",
+        "badge_bg":    "#ede9fe",
+        "api_key_env": "MAINTAINX_API_KEY_MTVERNON",  # new env var
+        "po_cache":    "po_cache_mtvernon.json",
+        "vendor_cache":"vendor_cache_mtvernon.json",
+        "wo_cache":    "wo_html_cache_mtvernon.json",
+    },
+}
+DEFAULT_SITE = "mckinney"
+
 # ── Cache paths ───────────────────────────────────────────────────────────────────
 _TMP = Path("/tmp") if IS_VERCEL else Path(__file__).parent
-WO_HTML_CACHE_FILE = _TMP / "wo_html_cache.json"
+
+
+def _cache_path(filename):
+    return _TMP / filename
 
 # ── Layer 1: in-memory cache (5 min) ─────────────────────────────────────────────
 CACHE_TTL_MINUTES = 5
@@ -202,16 +225,38 @@ def logout():
 
 # ── Helpers ───────────────────────────────────────────────────────────────────────
 
-def _get_api_key():
-    key = os.environ.get("MAINTAINX_API_KEY", "").strip()
+def _get_site():
+    """Return the active site key from session, defaulting to mckinney."""
+    return session.get("site", DEFAULT_SITE)
+
+
+def _get_site_cfg():
+    """Return the SITES config dict for the active site."""
+    return SITES.get(_get_site(), SITES[DEFAULT_SITE])
+
+
+def _get_api_key(site=None):
+    """Return the MaintainX API key for the given site (or active session site)."""
+    cfg     = SITES.get(site, _get_site_cfg())
+    env_var = cfg["api_key_env"]
+    key     = os.environ.get(env_var, "").strip()
     if key:
         return key
-    key_file = Path(__file__).parent / "MaintainX_API_key.txt"
-    if key_file.exists():
-        key = key_file.read_text().strip()
-        if key:
-            return key
+    # Local dev fallback: read from file (McKinney only)
+    if env_var == "MAINTAINX_API_KEY":
+        key_file = Path(__file__).parent / "MaintainX_API_key.txt"
+        if key_file.exists():
+            key = key_file.read_text().strip()
+            if key:
+                return key
     return None
+
+
+def _configure_po_module_for_site(site=None):
+    """Point po module cache files at the correct per-site paths."""
+    cfg = SITES.get(site, _get_site_cfg())
+    po.CACHE_FILE        = _cache_path(cfg["po_cache"])
+    po.VENDOR_CACHE_FILE = _cache_path(cfg["vendor_cache"])
 
 
 def _rate_limit_page(wait_seconds=65):
@@ -296,68 +341,120 @@ def index():
     return render_template("home.html")
 
 
+# ── Legacy redirects (bookmarks / old links still work) ───────────────────────────
 @app.route("/wo")
 @login_required
-def wo_dashboard():
-    """Work Order dashboard with two-layer caching (memory + file)."""
-    api_key = _get_api_key()
+def wo_legacy():
+    return redirect(url_for("wo_dashboard", site=DEFAULT_SITE))
+
+
+@app.route("/po")
+@login_required
+def po_legacy():
+    return redirect(url_for("po_dashboard", site=DEFAULT_SITE))
+
+
+@app.route("/po/refresh")
+@login_required
+def po_refresh_legacy():
+    return redirect(url_for("po_refresh", site=DEFAULT_SITE))
+
+
+# ── Site-aware routes ─────────────────────────────────────────────────────────────
+
+def _site_header_html(site, label):
+    """Small coloured site badge for injection into dashboard headers."""
+    cfg = SITES.get(site, SITES[DEFAULT_SITE])
+    other_site  = "mtvernon" if site == "mckinney" else "mckinney"
+    other_label = SITES[other_site]["label"]
+    return (
+        f'<span style="display:inline-flex;align-items:center;gap:6px;'
+        f'padding:3px 10px;border-radius:12px;font-size:.75rem;font-weight:700;'
+        f'background:{cfg["badge_bg"]};color:{cfg["badge_color"]};'
+        f'margin-right:6px">{label}</span>'
+        f'<a href="/" style="font-size:.75rem;color:#94a3b8;text-decoration:none;'
+        f'padding:3px 9px;border:1px solid #e2e8f0;border-radius:6px;white-space:nowrap">'
+        f'Switch to {other_label}</a>'
+    )
+
+
+@app.route("/site/<site>/wo")
+@login_required
+def wo_dashboard(site):
+    if site not in SITES:
+        return redirect(url_for("index"))
+    session["site"] = site
+
+    api_key = _get_api_key(site)
     if not api_key:
         return _error_page(
-            "MAINTAINX_API_KEY is not configured. "
+            f"API key for {SITES[site]['label']} is not configured. "
             "Add it in Vercel Project Settings then redeploy.",
             status=500,
         )
 
-    # Layer 1: in-memory
-    html = _mem_get("wo")
+    mem_key      = f"wo_{site}"
+    wo_cache_file = _cache_path(SITES[site]["wo_cache"])
+
+    html = _mem_get(mem_key)
     if html:
         return Response(html, content_type="text/html")
 
-    # Layer 2: file cache (survives cold starts)
-    html = _file_get(WO_HTML_CACHE_FILE)
+    html = _file_get(wo_cache_file)
     if html:
-        _mem_set("wo", html)
+        _mem_set(mem_key, html)
         return Response(html, content_type="text/html")
 
-    # Layer 3: fetch from API
     try:
         wos = mxd.fetch_all_open_work_orders(api_key)
         lines_dict, non_line = mxd.compute_line_scores(wos)
-        areas_dict = mxd.compute_area_scores(non_line)
+        areas_dict   = mxd.compute_area_scores(non_line)
         generated_at = datetime.now().strftime("%A, %B %d %Y at %I:%M %p")
-        html = mxd.build_html(lines_dict, areas_dict, wos, generated_at)
-        _mem_set("wo", html)
-        _file_set(WO_HTML_CACHE_FILE, html)
+        html         = mxd.build_html(lines_dict, areas_dict, wos, generated_at)
+        # Inject site badge into the header
+        site_badge = _site_header_html(site, SITES[site]["label"])
+        html = html.replace(
+            "<h1>Open Work Order Dashboard</h1>",
+            f'<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">'
+            f'{site_badge}<h1>Open Work Order Dashboard</h1></div>',
+            1,
+        )
+        _mem_set(mem_key, html)
+        _file_set(wo_cache_file, html)
         return Response(html, content_type="text/html")
     except Exception as e:
         return _error_page(f"Failed to fetch work orders from MaintainX: {e}")
 
 
-@app.route("/po")
+@app.route("/site/<site>/po")
 @login_required
-def po_dashboard():
-    """Purchase Order dashboard with two-layer caching (memory + file via po module)."""
-    api_key = _get_api_key()
+def po_dashboard(site):
+    if site not in SITES:
+        return redirect(url_for("index"))
+    session["site"] = site
+    _configure_po_module_for_site(site)
+
+    api_key = _get_api_key(site)
     if not api_key:
         return _error_page(
-            "MAINTAINX_API_KEY is not configured. "
+            f"API key for {SITES[site]['label']} is not configured. "
             "Add it in Vercel Project Settings then redeploy.",
             status=500,
         )
 
-    # Layer 1: in-memory
-    html = _mem_get("po")
+    mem_key = f"po_{site}"
+    html    = _mem_get(mem_key)
     if html:
         return Response(html, content_type="text/html")
 
-    # Single CSV call returns all PO data including vendor names, totals,
-    # and custom fields (Invoice Status).  Cache TTL = 60 min.
     try:
-        pos = po.fetch_pos_from_csv(api_key)
+        pos          = po.fetch_pos_from_csv(api_key)
         generated_at = datetime.now().strftime("%A, %B %d %Y at %I:%M %p")
-        html = po.build_po_html(pos, generated_at)
-        html = html.encode("utf-8", errors="replace").decode("utf-8")
-        _mem_set("po", html)
+        site_label   = SITES[site]["label"]
+        html         = po.build_po_html(pos, generated_at, site_label=site_label,
+                                        site=site)
+        html         = html.encode("utf-8", errors="replace").decode("utf-8")
+        _mem_set(mem_key, html)
         return Response(html, content_type="text/html; charset=utf-8")
     except po.RateLimitError as e:
         return _rate_limit_page(e.reset_seconds)
@@ -367,31 +464,33 @@ def po_dashboard():
         return _error_page(f"Failed to fetch purchase orders from MaintainX: {e}")
 
 
-@app.route("/po/refresh")
+@app.route("/site/<site>/po/refresh")
 @login_required
-def po_refresh():
-    """
-    Force a fresh CSV pull from MaintainX, bypassing the 60-min cache.
-    Useful after new POs are approved or Invoice Status values change in MaintainX.
-    """
-    api_key = _get_api_key()
-    if not api_key:
-        return _error_page("MAINTAINX_API_KEY is not configured.", status=500)
+def po_refresh(site):
+    if site not in SITES:
+        return redirect(url_for("index"))
+    session["site"] = site
+    _configure_po_module_for_site(site)
 
-    # Delete cache file so fetch_pos_from_csv() skips the freshness check
+    api_key = _get_api_key(site)
+    if not api_key:
+        return _error_page(f"API key for {SITES[site]['label']} is not configured.", status=500)
+
     try:
         if po.CACHE_FILE.exists():
             po.CACHE_FILE.unlink()
     except Exception:
         pass
-    _mem_cache.pop("po", None)
+    _mem_cache.pop(f"po_{site}", None)
 
     try:
-        pos = po.fetch_pos_from_csv(api_key)
+        pos          = po.fetch_pos_from_csv(api_key)
         generated_at = datetime.now().strftime("%A, %B %d %Y at %I:%M %p")
-        html = po.build_po_html(pos, generated_at)
-        html = html.encode("utf-8", errors="replace").decode("utf-8")
-        _mem_set("po", html)
+        site_label   = SITES[site]["label"]
+        html         = po.build_po_html(pos, generated_at, site_label=site_label,
+                                        site=site)
+        html         = html.encode("utf-8", errors="replace").decode("utf-8")
+        _mem_set(f"po_{site}", html)
         banner = (
             '<div style="background:#dcfce7;border:1px solid #16a34a;border-radius:8px;'
             'padding:10px 18px;margin:12px 28px;font-size:.85rem;color:#166534;">'
@@ -452,15 +551,16 @@ def _rate_limit_refresh_page(wait_seconds=65):
     return Response(html, status=200, content_type="text/html")
 
 
-@app.route("/vendor/update-infor-number", methods=["POST"])
+@app.route("/site/<site>/vendor/update-infor-number", methods=["POST"])
 @login_required
-def vendor_update_infor_number():
+def vendor_update_infor_number(site):
     """
     Update the 'Infor Vendor #' custom field on a vendor record.
     Body: { "vendor_id": 1227285, "infor_vendor_number": "V000076" | null }
     Returns: { "ok": true } or { "ok": false, "error": "..." }
     """
-    api_key = _get_api_key()
+    _configure_po_module_for_site(site)
+    api_key = _get_api_key(site)
     if not api_key:
         return jsonify({"ok": False, "error": "No API key configured"}), 500
 
@@ -485,8 +585,7 @@ def vendor_update_infor_number():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
-    # Bust in-memory PO cache so next /po load regenerates HTML with updated value
-    _mem_cache.pop("po", None)
+    _mem_cache.pop(f"po_{site}", None)
 
     # Update vendor cache in-place (find by vendor ID)
     try:
@@ -520,21 +619,22 @@ def vendor_update_infor_number():
     return jsonify({"ok": True})
 
 
-@app.route("/po/update-status", methods=["POST"])
+@app.route("/site/<site>/po/update-status", methods=["POST"])
 @login_required
-def po_update_status():
+def po_update_status(site):
     """
     Update the Invoice Status custom field on a single PO.
     Body: { "po_id": 123456, "invoice_status": "Paid" | "Unpaid" | null }
     Returns: { "ok": true } or { "ok": false, "error": "..." }
     """
-    api_key = _get_api_key()
+    _configure_po_module_for_site(site)
+    api_key = _get_api_key(site)
     if not api_key:
         return jsonify({"ok": False, "error": "No API key configured"}), 500
 
-    body          = request.get_json(silent=True) or {}
-    po_id         = body.get("po_id")
-    invoice_status = body.get("invoice_status")   # "Paid", "Unpaid", or None
+    body           = request.get_json(silent=True) or {}
+    po_id          = body.get("po_id")
+    invoice_status = body.get("invoice_status")   # "Paid", "Partially Paid", "Unpaid", or None
 
     if not po_id:
         return jsonify({"ok": False, "error": "Missing po_id"}), 400
@@ -553,8 +653,7 @@ def po_update_status():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
-    # Bust in-memory cache so next /po load regenerates HTML
-    _mem_cache.pop("po", None)
+    _mem_cache.pop(f"po_{site}", None)
 
     # Update the cache file in-place so the next /po request doesn't need
     # to re-fetch the CSV just because one status changed
@@ -580,13 +679,15 @@ def po_update_status():
     return jsonify({"ok": True})
 
 
-@app.route("/po/receipt/<int:po_id>")
+@app.route("/site/<site>/po/receipt/<int:po_id>")
 @login_required
-def po_receipt(po_id):
+def po_receipt(site, po_id):
     """
     Generate and stream a PDF payment receipt for a single PO.
     Built on-demand from the PO cache — no file storage required.
     """
+    _configure_po_module_for_site(site)
+
     # Try cache first
     po_dict = None
     try:
@@ -597,7 +698,7 @@ def po_receipt(po_id):
 
     # Cache miss (cold container on Vercel) — re-fetch CSV to find the PO
     if not po_dict:
-        api_key = _get_api_key()
+        api_key = _get_api_key(site)
         if api_key:
             try:
                 pos_list = po.fetch_pos_from_csv(api_key)

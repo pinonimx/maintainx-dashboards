@@ -1035,7 +1035,7 @@ def _title_redundant(title, vendor):
 
 
 # ── Interactive HTML dashboard ───────────────────────────────────────────────────
-def build_po_html(pos, generated_at):
+def build_po_html(pos, generated_at, site_label="McKinney", site="mckinney"):
     n_ready   = sum(1 for p in pos if (p.get("status") or "").upper() == "COMPLETED")
     n_partial = sum(1 for p in pos if (p.get("status") or "").upper() == "PARTIALLY_FULFILLED")
     n_needs   = sum(1 for p in pos if (p.get("invoice_status") or "").strip() != "Paid")
@@ -1122,7 +1122,7 @@ def build_po_html(pos, generated_at):
 
         # Receipt link — shown for Partially Paid and Paid rows
         receipt_btn = (
-            f'<a href="/po/receipt/{po_id}" class="receipt-link"'
+            f'<a href="/site/{site}/po/receipt/{po_id}" class="receipt-link"'
             f' style="display:inline-block;padding:4px 9px;background:#16a34a;color:#fff;'
             f'border-radius:5px;font-size:.73rem;font-weight:600;text-decoration:none;'
             f'margin-left:2px" title="Download PDF receipt">&#128196;&nbsp;Receipt</a>'
@@ -1191,11 +1191,11 @@ def build_po_html(pos, generated_at):
     <a href="/" style="font-size:.8rem;color:#64748b;text-decoration:none;padding:5px 12px;border:1px solid #e2e8f0;border-radius:6px;white-space:nowrap;">&#8592; Home</a>
     <div>
       <h1>Accounts Payable &mdash; Purchase Orders</h1>
-      <div class="sub">Generated {generated_at}</div>
+      <div class="sub">{site_label} &middot; Generated {generated_at}</div>
     </div>
   </div>
   <div style="display:flex;gap:8px;align-items:center">
-    <a href="/po/refresh" title="Pull latest data from MaintainX" style="font-size:.8rem;color:#2563eb;text-decoration:none;padding:5px 12px;border:1px solid #bfdbfe;border-radius:6px;white-space:nowrap;background:#eff6ff;">&#8635; Refresh Data</a>
+    <a href="/site/{site}/po/refresh" title="Pull latest data from MaintainX" style="font-size:.8rem;color:#2563eb;text-decoration:none;padding:5px 12px;border:1px solid #bfdbfe;border-radius:6px;white-space:nowrap;background:#eff6ff;">&#8635; Refresh Data</a>
     <a href="/logout" title="Sign out" style="font-size:.8rem;color:#6b7280;text-decoration:none;padding:5px 12px;border:1px solid #e2e8f0;border-radius:6px;white-space:nowrap;">&#x2192; Sign Out</a>
   </div>
 </div>
@@ -1285,7 +1285,7 @@ function setInvStatus(poId, newVal, clickedBtn) {{
   // Disable all buttons while saving
   btns.forEach(function(b) {{ b.disabled = true; b.style.opacity = '.5'; }});
 
-  fetch('/po/update-status', {{
+  fetch('/site/{site}/po/update-status', {{
     method:  'POST',
     headers: {{'Content-Type': 'application/json'}},
     body:    JSON.stringify({{po_id: poId, invoice_status: newVal || null}})
@@ -1327,8 +1327,8 @@ function setInvStatus(poId, newVal, clickedBtn) {{
           td.querySelector('div').appendChild(a);
           existing = a;
         }}
-        existing.href = '/po/receipt/' + poId;
-        setTimeout(function() {{ window.location.href = '/po/receipt/' + poId; }}, 350);
+        existing.href = '/site/{site}/po/receipt/' + poId;
+        setTimeout(function() {{ window.location.href = '/site/{site}/po/receipt/' + poId; }}, 350);
         setTimeout(function() {{ applyFilters(); }}, 900);
       }} else {{
         // Remove receipt link if present (Unpaid or not-set)
@@ -1356,7 +1356,7 @@ function saveInforNum(poId, vendorId, btn) {{
   btn.textContent      = 'Saving\u2026';
   btn.disabled         = true;
   btn.style.background = '#6b7280';
-  fetch('/vendor/update-infor-number', {{
+  fetch('/site/{site}/vendor/update-infor-number', {{
     method:  'POST',
     headers: {{'Content-Type': 'application/json'}},
     body:    JSON.stringify({{vendor_id: vendorId, infor_vendor_number: newVal || null}})
