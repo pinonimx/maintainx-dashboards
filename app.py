@@ -16,6 +16,7 @@ Routes:
 
 import os
 import json
+import traceback
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
@@ -627,31 +628,41 @@ def po_update_status(site):
     Body: { "po_id": 123456, "invoice_status": "Paid" | "Unpaid" | null }
     Returns: { "ok": true } or { "ok": false, "error": "..." }
     """
-    _configure_po_module_for_site(site)
-    api_key = _get_api_key(site)
-    if not api_key:
-        return jsonify({"ok": False, "error": "No API key configured"}), 500
-
-    body           = request.get_json(silent=True) or {}
-    po_id          = body.get("po_id")
-    invoice_status = body.get("invoice_status")   # "Paid", "Partially Paid", "Unpaid", or None
-
-    if not po_id:
-        return jsonify({"ok": False, "error": "Missing po_id"}), 400
-
     try:
-        resp = _http.patch(
-            f"https://api.getmaintainx.com/v1/purchaseorders/{po_id}",
-            headers={
-                "Authorization":  f"Bearer {api_key}",
-                "Content-Type":   "application/json",
-            },
-            json={"extraFields": {"Invoice Status": invoice_status}},
-            timeout=15,
-        )
-        resp.raise_for_status()
+        _configure_po_module_for_site(site)
+        api_key = _get_api_key(site)
+        if not api_key:
+            print(f"[update-status] No API key for site={site}")
+            return jsonify({"ok": False, "error": f"No API key configured for site '{site}'"}), 200
+
+        body           = request.get_json(silent=True) or {}
+        po_id          = body.get("po_id")
+        invoice_status = body.get("invoice_status")   # "Paid", "Partially Paid", "Unpaid", or None
+
+        print(f"[update-status] site={site} po_id={po_id} status={invoice_status}")
+
+        if not po_id:
+            return jsonify({"ok": False, "error": "Missing po_id"}), 200
+
+        try:
+            resp = _http.patch(
+                f"https://api.getmaintainx.com/v1/purchaseorders/{po_id}",
+                headers={
+                    "Authorization":  f"Bearer {api_key}",
+                    "Content-Type":   "application/json",
+                },
+                json={"extraFields": {"Invoice Status": invoice_status}},
+                timeout=15,
+            )
+            print(f"[update-status] MaintainX PATCH status={resp.status_code} body={resp.text[:300]}")
+            resp.raise_for_status()
+        except Exception as e:
+            print(f"[update-status] PATCH failed: {e}\n{traceback.format_exc()}")
+            return jsonify({"ok": False, "error": str(e)}), 200
+
     except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
+        print(f"[update-status] Unhandled error: {e}\n{traceback.format_exc()}")
+        return jsonify({"ok": False, "error": f"Server error: {e}"}), 200
 
     _mem_cache.pop(f"po_{site}", None)
 
