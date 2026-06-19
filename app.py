@@ -644,6 +644,11 @@ def po_update_status(site):
         if not po_id:
             return jsonify({"ok": False, "error": "Missing po_id"}), 200
 
+        # MaintainX "Paid Status" field only has Paid / Unpaid.
+        # "Partially Paid" is dashboard-only — send "Unpaid" to MaintainX so the
+        # field stays valid, but we still store "Partially Paid" in our cache below.
+        mx_status = "Unpaid" if invoice_status == "Partially Paid" else invoice_status
+
         try:
             resp = _http.patch(
                 f"https://api.getmaintainx.com/v1/purchaseorders/{po_id}",
@@ -651,7 +656,7 @@ def po_update_status(site):
                     "Authorization":  f"Bearer {api_key}",
                     "Content-Type":   "application/json",
                 },
-                json={"extraFields": {"Invoice Status": invoice_status}},
+                json={"extraFields": {"Paid Status": mx_status}},
                 timeout=15,
             )
             print(f"[update-status] MaintainX PATCH status={resp.status_code} body={resp.text[:300]}")

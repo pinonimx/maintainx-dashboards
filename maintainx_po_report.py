@@ -227,7 +227,8 @@ def fetch_pos_from_csv(api_key):
         except (ValueError, TypeError):
             total_received = None
 
-        invoice_status = (first.get("Invoice Status") or "").strip() or None
+        # MaintainX API field is "Paid Status"; CSV export may use either name
+        invoice_status = (first.get("Paid Status") or first.get("Invoice Status") or "").strip() or None
 
         # Approver name — try common column name variants
         approver_name = (
